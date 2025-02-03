@@ -1,30 +1,58 @@
-import os
-import pandas as pd
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import WebSocket
+import numpy as np
+import asyncio
 
+class BybitDataFetcher:
+    def __init__(self, symbol='BTCUSDT', callback=None):
+        self.symbol = symbol
+        self.callback = callback
+        self.ws = WebSocket(
+            testnet=False,  # Set to True for testnet
+            channel_type="linear"  # Use "linear" for USDT contracts
+        )
 
-def fetch_bybit_data():
-    """Fetch Bitcoin historical data from Bybit."""
-    client = HTTP(testnet=True)  # Use testnet for testing
-    response = client.get_kline(
-        category="linear",
-        symbol="BTCUSDT",
-        interval="D",  # Daily data
-        limit=1095  # Fetch 1095 days of data
-    )
-    data = pd.DataFrame(response['result']['list'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    return data
+    async def stream_market_data(self):
+        """
+        Stream real-time market data from Bybit.
+        """
+        def handle_message(message):
+            """
+            Handle incoming WebSocket messages.
+            """
+            if 'data' in message:
+                price = float(message['data'][0]['last_price'])
+                if self.callback:
+                    self.callback(price)  # Send price to trading bot
 
+        # Subscribe to the trade stream for the specified symbol
+        self.ws.trade_stream(self.symbol, handle_message)
 
-def save_data(data):
-    """Save data to a CSV file."""
-    os.makedirs('data', exist_ok=True)
-    data.to_csv('data/btc_historical.csv', index=False)
+        # Keep the WebSocket connection alive
+        while True:
+            await asyncio.sleep(1)
 
+    def compute_features(self, prices: list) -> np.ndarray:
+        """
+        Compute features for the ML model.
+        """
+        window = np.array(prices[-50:])  # Last 50 data points
+        features = [
+            np.mean(window),  # Moving average
+            np.std(window),   # Volatility
+            (window[-1] - window[0]) / window[0]  # Momentum
+        ]
+        return np.array(features)
 
+async def main(callback):
+    """
+    Main function to start streaming data.
+    """
+    fetcher = BybitDataFetcher(symbol='BTCUSDT', callback=callback)
+    await fetcher.stream_market_data()
+
+# Example usage
 if __name__ == "__main__":
-    print("Fetching Bitcoin historical data from Bybit...")
-    data = fetch_bybit_data()
-    save_data(data)
-    print("Data saved to 'data/btc_historical.csv'")
+    def print_price(price):
+        print(f"Current Price: {price}")
+
+    asyncio.run(main(print_price))
