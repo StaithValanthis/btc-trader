@@ -15,7 +15,8 @@ class OnlineLearner:
             x_ref=self.x_ref,  # Provide reference dataset
             ert=25,
             window_size=self.window_size,
-            input_shape=(self.n_features,)
+            input_shape=(self.n_features,),
+            backend='pytorch'  # Use PyTorch backend
         )
 
     def update(self, X: np.ndarray, y: np.ndarray):

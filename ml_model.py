@@ -1,37 +1,46 @@
-from sklearn.linear_model import SGDRegressor
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import joblib
 
-class MLModel:
-    def __init__(self):
-        self.model = SGDRegressor(warm_start=True, loss='huber')
-        self.is_initialized = False
+class TradingModel(nn.Module):
+    def __init__(self, input_size=3, hidden_size=32, output_size=1):
+        super(TradingModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, output_size)
+        self.relu = nn.ReLU()
 
-    def train(self, X: np.ndarray, y: np.ndarray):
-        """
-        Train the model incrementally.
-        """
-        if not self.is_initialized:
-            self.model.partial_fit(X, y)
-            self.is_initialized = True
-        else:
-            self.model.partial_fit(X, y)
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-    def predict(self, X: np.ndarray) -> float:
-        """
-        Predict using the model.
-        """
-        return self.model.predict(X.reshape(1, -1))[0]
+class ModelTrainer:
+    def __init__(self, model, learning_rate=0.001):
+        self.model = model
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
-    def save(self, path: str = 'ml_model.pkl'):
-        """
-        Save the model to disk.
-        """
-        joblib.dump(self.model, path)
+    def train(self, X: np.ndarray, y: np.ndarray, epochs=10):
+        X = torch.tensor(X, dtype=torch.float32)
+        y = torch.tensor(y, dtype=torch.float32)
+        for _ in range(epochs):
+            self.optimizer.zero_grad()
+            outputs = self.model(X)
+            loss = self.criterion(outputs, y)
+            loss.backward()
+            self.optimizer.step()
+        return loss.item()
 
-    def load(self, path: str = 'ml_model.pkl'):
-        """
-        Load the model from disk.
-        """
-        self.model = joblib.load(path)
-        self.is_initialized = True
+    def predict(self, X: np.ndarray):
+        with torch.no_grad():
+            X = torch.tensor(X, dtype=torch.float32)
+            return self.model(X).numpy()
+
+    def save(self, path: str):
+        torch.save(self.model.state_dict(), path)
+
+    def load(self, path: str):
+        self.model.load_state_dict(torch.load(path))

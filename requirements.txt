@@ -1,11 +1,11 @@
 # Core Dependencies
 pybit==3.3.0
-scikit-learn==1.3.2
-alibi-detect[pytorch]==0.15.1
+torch==2.0.1
+psycopg2-binary==2.9.9
 numpy==1.26.4
 python-dotenv==1.0.0
-numba==0.59.1
-torch==2.0.1
+alibi-detect[pytorch]==0.15.1
+pandas==2.1.1
 
 # Data Processing
 pandas==2.1.1
