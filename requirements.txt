@@ -1,13 +1,12 @@
-tensorflow-cpu==2.16.1
-keras==2.16.0rc0  # Compatible pre-release version
-scikit-learn==1.3.2
-alibi-detect==0.12.0
-pybit==5.9.0
-pandas==2.2.3
-river==0.22.0
-python-dotenv==1.0.0
-numpy==1.24.4
-protobuf==3.20.3
-tensorflow-probability==0.22.0
-ml-dtypes==0.3.2
-typing-extensions==4.8.0
+tensorflow-cpu==2.16.1  # Includes Keras 2.16.0 internally
+scikit-learn==1.3.2     # Stable version for ML models
+alibi-detect==0.12.0    # Compatible with TF 2.16.1
+pybit==5.9.0            # Latest stable version for Bybit API
+pandas==2.2.3           # Stable version for data handling
+river==0.22.0           # Online learning library
+python-dotenv==1.0.0    # Environment variable management
+numpy==1.24.4           # Compatible with TF 2.16.1
+protobuf==3.20.3        # Required by TensorFlow
+tensorflow-probability==0.22.0  # Compatible with TF 2.16.1
+ml-dtypes==0.3.2        # Required by TensorFlow
+typing-extensions==4.8.0  # Required by TensorFlow
