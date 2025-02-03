@@ -1,96 +1,37 @@
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.exceptions import NotFittedError
+from sklearn.linear_model import SGDRegressor
 import numpy as np
-import logging
-
-# Configure logging
-logger = logging.getLogger(__name__)
+import joblib
 
 class MLModel:
     def __init__(self):
-        """
-        Initialize the machine learning model.
-        """
-        self.model = self.build_model()
-        self.is_trained = False  # Track whether the model has been trained
-        self.feature_shape = None  # Store the expected input feature shape
+        self.model = SGDRegressor(warm_start=True, loss='huber')
+        self.is_initialized = False
 
-    def build_model(self):
+    def train(self, X: np.ndarray, y: np.ndarray):
         """
-        Build the machine learning pipeline.
-        
-        Returns:
-            Pipeline: A scikit-learn pipeline with preprocessing and classifier.
+        Train the model incrementally.
         """
-        return Pipeline([
-            ('scaler', StandardScaler()),  # Standardize features
-            ('classifier', RandomForestClassifier(
-                n_estimators=100,  # Number of trees in the forest
-                max_depth=5,  # Maximum depth of each tree
-                random_state=42,  # Seed for reproducibility
-                class_weight='balanced_subsample',  # Handle class imbalance
-                verbose=1,  # Print training progress
-                n_jobs=-1  # Use all available CPU cores
-            ))
-        ])
+        if not self.is_initialized:
+            self.model.partial_fit(X, y)
+            self.is_initialized = True
+        else:
+            self.model.partial_fit(X, y)
 
-    def train(self, X, y):
+    def predict(self, X: np.ndarray) -> float:
         """
-        Train the model on the provided data.
-        
-        Args:
-            X (numpy.ndarray): Training features.
-            y (numpy.ndarray): Training labels.
-            
-        Returns:
-            bool: True if training succeeded, False otherwise.
+        Predict using the model.
         """
-        try:
-            # Validate input data
-            if X.shape[0] < 50:
-                raise ValueError("Minimum 50 samples required for training")
-                
-            # Store feature shape for validation during prediction
-            self.feature_shape = X.shape[1]
-            
-            # Train the model
-            self.model.fit(X, y)
-            self.is_trained = True
-            logger.info(f"Model trained successfully on {X.shape[0]} samples")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Training failed: {str(e)}")
-            self.is_trained = False
-            return False
+        return self.model.predict(X.reshape(1, -1))[0]
 
-    def predict(self, X):
+    def save(self, path: str = 'ml_model.pkl'):
         """
-        Generate predictions using the trained model.
-        
-        Args:
-            X (numpy.ndarray): Input features for prediction.
-            
-        Returns:
-            numpy.ndarray: Predicted probabilities for the positive class.
-            
-        Raises:
-            NotFittedError: If the model is not trained.
-            ValueError: If the input feature shape is incorrect.
+        Save the model to disk.
         """
-        # Validate model state
-        if not self.is_trained:
-            raise NotFittedError("Model must be trained before making predictions")
-            
-        # Validate input shape
-        if X.shape[1] != self.feature_shape:
-            raise ValueError(f"Expected {self.feature_shape} features, got {X.shape[1]}")
-            
-        try:
-            # Generate predictions
-            return self.model.predict_proba(X)[:, 1]
-        except Exception as e:
-            logger.error(f"Prediction failed: {str(e)}")
-            return np.zeros(X.shape[0])  # Return neutral predictions on error
+        joblib.dump(self.model, path)
+
+    def load(self, path: str = 'ml_model.pkl'):
+        """
+        Load the model from disk.
+        """
+        self.model = joblib.load(path)
+        self.is_initialized = True
