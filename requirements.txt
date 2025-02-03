@@ -1,10 +1,10 @@
 # Core Dependencies
-pybit==5.9.0  # Use latest version
+pybit==5.9.0
 torch==2.0.1
 psycopg2-binary==2.9.9
-numpy==1.26.4
+numpy==1.26.4  # Ensure compatibility with alibi-detect
 python-dotenv==1.0.0
-alibi-detect[pytorch]==0.15.1
+alibi-detect[torch]==0.12.0  # Use "torch" instead of "pytorch"
 pandas==2.1.1
 
 # Data Processing
