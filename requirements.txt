@@ -1,7 +1,8 @@
+wheel==0.43.0  # Explicitly add wheel for modern packaging
 tensorflow-cpu==2.16.1
 scikit-learn==1.3.2
 alibi-detect==0.12.0
-pybit==5.9.0
+pybit==5.9.0  # Will now install with wheel support
 pandas==2.2.3
 river==0.22.0
 python-dotenv==1.0.0
