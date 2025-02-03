@@ -1,5 +1,5 @@
 # Core Dependencies
-pybit==3.3.0
+pybit==5.9.0  # Use latest version
 torch==2.0.1
 psycopg2-binary==2.9.9
 numpy==1.26.4
