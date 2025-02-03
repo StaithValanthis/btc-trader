@@ -4,7 +4,7 @@ pybit==5.9.0  # Will now install with wheel support
 pandas==2.2.3
 river==0.22.0
 python-dotenv==1.0.0
-numpy==1.24.4
+numpy==1.24.3
 protobuf==3.20.3
 tensorflow==2.13.0
 alibi-detect==0.12.0
