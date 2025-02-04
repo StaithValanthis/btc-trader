@@ -4,16 +4,41 @@ from datetime import datetime
 import numpy as np
 import asyncio
 import json
+import signal
+import sys
 
 class BitcoinTrader:
     def __init__(self):
         self.db = TimescaleDB()
         self.data_buffer = []
-        self.window_size = 50  # For feature calculation
+        self.window_size = 50
+        self.fetcher = BybitDataFetcher(callback=self.handle_price)
+        self.running = True
+
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print(f"Received signal {signum}, shutting down...")
+        self.running = False
+        self.fetcher.stop()
+        sys.exit(0)
 
     async def run(self):
-        fetcher = BybitDataFetcher(callback=self.handle_price)
-        await fetcher.stream_market_data()
+        """Main trading loop"""
+        try:
+            await self.fetcher.stream_market_data()
+        except Exception as e:
+            print(f"Critical error: {e}")
+        finally:
+            await self.cleanup()
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        await self.fetcher._disconnect()
+        self.db.close()
 
     def handle_price(self, price: float):
         # Record timestamp
