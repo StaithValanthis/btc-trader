@@ -4,11 +4,11 @@ channels:
   - pytorch
   - defaults
 dependencies:
-  - python=3.10
+  - python
   - pybit
   - pytorch
   - psycopg2
-  - numpy=1.26.4
+  - numpy
   - python-dotenv
   - alibi-detect
   - pandas
