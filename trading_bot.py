@@ -1,5 +1,4 @@
 from fetch_data import BybitDataFetcher
-from ml_model import TradingModel, ModelTrainer
 from database import TimescaleDB
 from datetime import datetime
 import numpy as np
@@ -9,8 +8,6 @@ import json
 class BitcoinTrader:
     def __init__(self):
         self.db = TimescaleDB()
-        self.model = TradingModel()
-        self.trainer = ModelTrainer(self.model)
         self.data_buffer = []
         self.window_size = 50  # For feature calculation
 
