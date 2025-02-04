@@ -4,8 +4,7 @@ channels:
   - pytorch
   - defaults
 dependencies:
-  - python=3.10
-  - pybit
+  - python=3.9
   - pytorch
   - psycopg2
   - numpy=1.26.4
