@@ -1,0 +1,15 @@
+name: trading-bot
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pybit
+  - pytorch
+  - psycopg2
+  - numpy=1.26.4
+  - python-dotenv
+  - alibi-detect
+  - pandas
+  - ta-lib
