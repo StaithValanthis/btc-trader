@@ -1,7 +1,7 @@
+import json
 from pybit.unified_trading import WebSocket
 import asyncio
 from structlog import get_logger
-from app.core.config import Config
 from app.core.database import Database
 from datetime import datetime, timezone
 
@@ -12,18 +12,23 @@ class BybitMarketData:
         self.symbol = symbol
         self.ws = None
         self.running = False
+        self.loop = asyncio.get_event_loop()
 
     async def _connect_websocket(self):
         try:
             self.ws = WebSocket(
                 testnet=False,
                 channel_type="linear",
-                api_key=Config.BYBIT_CONFIG['api_key'],
-                api_secret=Config.BYBIT_CONFIG['api_secret']
+                api_key="your_api_key",
+                api_secret="your_api_secret",
+                trace_logging=True
             )
             
             def handle_message(message):
-                asyncio.create_task(self._process_message(message))
+                asyncio.run_coroutine_threadsafe(
+                    self._process_message(message),
+                    self.loop
+                )
                 
             self.ws.trade_stream(
                 symbol=self.symbol,
@@ -36,14 +41,14 @@ class BybitMarketData:
 
     async def _process_message(self, msg):
         try:
-            if 'data' in msg:
+            if 'data' in msg and isinstance(msg['data'], list):
                 for trade in msg['data']:
-                    price = float(trade['p'])
-                    features = {
-                        'size': trade['v'],
-                        'side': trade['S'],
-                        'trade_time': trade['T']
-                    }
+                    price = float(trade.get('p', 0))
+                    features = json.dumps({
+                        'size': trade.get('v', 0),
+                        'side': trade.get('S', 'Unknown'),
+                        'trade_time': trade.get('T', 0)
+                    })
                     await Database.execute('''
                         INSERT INTO market_data (time, price, features)
                         VALUES ($1, $2, $3)

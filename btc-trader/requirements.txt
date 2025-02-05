@@ -1,6 +1,6 @@
-pybit==4.3.0
+pybit==5.9.0  # Latest version as of Jul 2024
 asyncpg==0.29.0
-pandas==2.2.2
+pandas==2.2.3  # Stable non-yanked version
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
 websockets==12.0
