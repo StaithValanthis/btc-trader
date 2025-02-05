@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   postgres:
-    image: timescale/timescaledb:latest-pg14
+    image: timescale/timescaledb:2.13.0-pg14
     environment:
       POSTGRES_DB: trading_bot
       POSTGRES_USER: postgres
@@ -13,6 +13,11 @@ services:
       - "5432:5432"
     networks:
       - trading-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   trader-app:
     build: .
@@ -23,10 +28,14 @@ services:
       DB_PASSWORD: postgres
       BYBIT_API_KEY: ${BYBIT_API_KEY}
       BYBIT_API_SECRET: ${BYBIT_API_SECRET}
+      LOG_LEVEL: INFO
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - trading-net
+    volumes:
+      - ./app:/app
 
 volumes:
   timescaledb-data:
