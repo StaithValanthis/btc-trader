@@ -26,11 +26,6 @@ class TimescaleDB:
     def log_market_data(self, time: datetime, price: float, features: dict):
         """
         Log market data to the `market_data` table.
-
-        Args:
-            time (datetime): Timestamp of the data point.
-            price (float): Price at the time.
-            features (dict): Computed features (e.g., moving average, volatility).
         """
         try:
             query = """
@@ -46,12 +41,6 @@ class TimescaleDB:
     def log_trade(self, time: datetime, price: float, signal: str, profit_loss: float = None):
         """
         Log a trade to the `trades` table.
-
-        Args:
-            time (datetime): Timestamp of the trade.
-            price (float): Execution price.
-            signal (str): Trade signal (e.g., BUY, SELL, HOLD).
-            profit_loss (float, optional): Profit or loss from the trade.
         """
         try:
             query = """
@@ -67,12 +56,6 @@ class TimescaleDB:
     def get_historical_data(self, lookback_days: int = 30):
         """
         Retrieve historical market data.
-
-        Args:
-            lookback_days (int): Number of days to look back.
-
-        Returns:
-            list: A list of tuples containing (time, price, features).
         """
         try:
             query = """

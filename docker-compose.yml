@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg14
+    environment:
+      POSTGRES_DB: trading_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - trading-net
+
+  trader-app:
+    build: .
+    environment:
+      DB_HOST: postgres
+      DB_NAME: trading_bot
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      BYBIT_API_KEY: ${BYBIT_API_KEY}
+      BYBIT_API_SECRET: ${BYBIT_API_SECRET}
+    depends_on:
+      - postgres
+    networks:
+      - trading-net
+
+volumes:
+  timescaledb-data:
+
+networks:
+  trading-net:

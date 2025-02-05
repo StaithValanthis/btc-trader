@@ -1,0 +1,11 @@
+{
+    "docker.composeFile": "docker-compose.yml",
+    "docker.services": ["postgres", "trader-app"],
+    "postgres.connections": [{
+        "name": "Trading Bot DB",
+        "host": "localhost",
+        "database": "trading_bot",
+        "user": "postgres",
+        "password": "postgres"
+    }]
+}
