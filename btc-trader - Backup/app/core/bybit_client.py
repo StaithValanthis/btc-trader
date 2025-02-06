@@ -21,18 +21,15 @@ class BybitMarketData:
                 channel_type="linear",
                 api_key="your_api_key",
                 api_secret="your_api_secret",
-                trace_logging=False  # Disabled to remove debug noise
+                trace_logging=True
             )
             
             def handle_message(message):
-                if 'data' in message and isinstance(message['data'], list):
-                    for trade in message['data']:
-                        if trade.get("S") in ["Buy", "Sell"] and trade.get("BT") == False:  # Only log bot-executed trades
-                            asyncio.run_coroutine_threadsafe(
-                                self._process_message(trade),
-                                self.loop
-                            )
-            
+                asyncio.run_coroutine_threadsafe(
+                    self._process_message(message),
+                    self.loop
+                )
+                
             self.ws.trade_stream(
                 symbol=self.symbol,
                 callback=handle_message
@@ -42,20 +39,20 @@ class BybitMarketData:
             logger.error("WebSocket connection failed", error=str(e))
             raise
 
-    async def _process_message(self, trade):
+    async def _process_message(self, msg):
         try:
-            price = float(trade.get('p', 0))
-            features = json.dumps({
-                'size': trade.get('v', 0),
-                'side': trade.get('S', 'Unknown'),
-                'trade_time': trade.get('T', 0)
-            })
-            await Database.execute('''
-                INSERT INTO market_data (time, price, features)
-                VALUES ($1, $2, $3)
-            ''', datetime.now(timezone.utc), price, features)
-            
-            logger.info(f"TRADE EXECUTED: {trade.get('S')} @ {price}")
+            if 'data' in msg and isinstance(msg['data'], list):
+                for trade in msg['data']:
+                    price = float(trade.get('p', 0))
+                    features = json.dumps({
+                        'size': trade.get('v', 0),
+                        'side': trade.get('S', 'Unknown'),
+                        'trade_time': trade.get('T', 0)
+                    })
+                    await Database.execute('''
+                        INSERT INTO market_data (time, price, features)
+                        VALUES ($1, $2, $3)
+                    ''', datetime.now(timezone.utc), price, features)
         except Exception as e:
             logger.error("Message processing failed", error=str(e))
 

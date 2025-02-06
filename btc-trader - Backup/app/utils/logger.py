@@ -18,6 +18,6 @@ def configure_logger():
 
     logging.basicConfig(
         format="%(message)s",
-        level=logging.WARNING,  # Only show warnings and trade executions
+        level=logging.INFO,
         handlers=[logging.StreamHandler()]
     )

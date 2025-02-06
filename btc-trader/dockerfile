@@ -2,30 +2,36 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including TA-Lib requirements
 RUN apt-get update && apt-get install -y \
-    gcc \
+    build-essential \
+    wget \
     python3-dev \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Update pip
-RUN pip install --upgrade pip
+# Download and install TA-Lib
+RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
+    && tar -xvzf ta-lib-0.4.0-src.tar.gz \
+    && cd ta-lib/ \
+    && ./configure --prefix=/usr \
+    && make \
+    && make install \
+    && cd .. \
+    && rm -rf ta-lib-0.4.0-src.tar.gz ta-lib
 
-# Copy requirements first for caching
+# Install Python dependencies
+RUN pip install --upgrade pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY . .
 
-# Set Python path
 ENV PYTHONPATH=/app
 
-# Create non-root user
 RUN useradd -m trader && \
     chown -R trader:trader /app
 
 USER trader
 
-# Run the application
 CMD ["python", "main.py"]

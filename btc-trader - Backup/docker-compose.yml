@@ -28,8 +28,7 @@ services:
       DB_PASSWORD: postgres
       BYBIT_API_KEY: ${BYBIT_API_KEY}
       BYBIT_API_SECRET: ${BYBIT_API_SECRET}
-      BYBIT_TESTNET: ${BYBIT_TESTNET}
-      POSITION_SIZE: ${POSITION_SIZE}
+      LOG_LEVEL: INFO
     depends_on:
       postgres:
         condition: service_healthy
