@@ -29,9 +29,12 @@ COPY . .
 
 ENV PYTHONPATH=/app
 
+ENV TF_CPP_MIN_LOG_LEVEL=3
+
 RUN useradd -m trader && \
     chown -R trader:trader /app
 
 USER trader
 
 CMD ["python", "main.py"]
+

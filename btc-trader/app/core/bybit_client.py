@@ -4,11 +4,12 @@ import asyncio
 from structlog import get_logger
 from app.core.database import Database
 from datetime import datetime, timezone
+from app.core.config import Config
 
 logger = get_logger(__name__)
 
 class BybitMarketData:
-    def __init__(self, symbol: str = "BTCUSDT"):
+    def __init__(self, symbol: str = Config.TRADING_CONFIG['symbol']):
         self.symbol = symbol
         self.ws = None
         self.running = False
@@ -17,21 +18,21 @@ class BybitMarketData:
     async def _connect_websocket(self):
         try:
             self.ws = WebSocket(
-                testnet=False,
+                testnet=Config.BYBIT_CONFIG['testnet'],
                 channel_type="linear",
-                api_key="your_api_key",
-                api_secret="your_api_secret",
-                trace_logging=False  # Disabled to remove debug noise
+                api_key=Config.BYBIT_CONFIG['api_key'],
+                api_secret=Config.BYBIT_CONFIG['api_secret'],
+                trace_logging=False  # Enable verbose WS logging
             )
             
             def handle_message(message):
+                logger.debug("WebSocket message received", message=message)
                 if 'data' in message and isinstance(message['data'], list):
                     for trade in message['data']:
-                        if trade.get("S") in ["Buy", "Sell"] and trade.get("BT") == False:  # Only log bot-executed trades
-                            asyncio.run_coroutine_threadsafe(
-                                self._process_message(trade),
-                                self.loop
-                            )
+                        asyncio.run_coroutine_threadsafe(
+                            self._process_message(trade),
+                            self.loop
+                        )
             
             self.ws.trade_stream(
                 symbol=self.symbol,
@@ -44,20 +45,15 @@ class BybitMarketData:
 
     async def _process_message(self, trade):
         try:
-            price = float(trade.get('p', 0))
-            features = json.dumps({
-                'size': trade.get('v', 0),
-                'side': trade.get('S', 'Unknown'),
-                'trade_time': trade.get('T', 0)
-            })
             await Database.execute('''
-                INSERT INTO market_data (time, price, features)
+                INSERT INTO market_data (time, price, volume)
                 VALUES ($1, $2, $3)
-            ''', datetime.now(timezone.utc), price, features)
-            
-            logger.info(f"TRADE EXECUTED: {trade.get('S')} @ {price}")
+                ON CONFLICT (time) DO NOTHING
+            ''', datetime.now(timezone.utc), 
+               float(trade.get('p', 0)), 
+               float(trade.get('v', 0)))
         except Exception as e:
-            logger.error("Message processing failed", error=str(e))
+            logger.error("Data processing failed", error=str(e))
 
     async def run(self):
         self.running = True

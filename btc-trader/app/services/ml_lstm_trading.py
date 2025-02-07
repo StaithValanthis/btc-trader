@@ -137,3 +137,41 @@ class MLTradeService:
     async def stop(self):
         self.running = False
         logger.warning("LSTM Trading Service Stopped")
+
+class LSTMStrategy:
+    def __init__(self, trade_service: TradeService):
+        # ... existing code ...
+        self.warmup_start_time = None  # Track warmup start time
+
+    async def _check_data_availability(self):
+        """Check data readiness with progress tracking."""
+        if not self.data_ready:
+            if not self.warmup_start_time:
+                self.warmup_start_time = time.time()
+                logger.info("Warmup phase started")
+
+            # Data progress
+            count = await Database.fetch("SELECT COUNT(*) FROM market_data")
+            data_progress = count[0]['count'] / Config.MODEL_CONFIG['min_training_samples']
+            
+            # Time progress
+            elapsed = time.time() - self.warmup_start_time
+            time_progress = elapsed / Config.MODEL_CONFIG['warmup_period']
+            
+            # Combined progress
+            overall_progress = min(data_progress, time_progress) * 100
+            
+            logger.info(
+                "Warmup Progress",
+                data=f"{count[0]['count']}/{Config.MODEL_CONFIG['min_training_samples']}",
+                time_remaining=f"{int((Config.MODEL_CONFIG['warmup_period'] - elapsed)/60)}m",
+                progress=f"{overall_progress:.1f}%"
+            )
+            
+            if count[0]['count'] >= Config.MODEL_CONFIG['min_training_samples'] and \
+               elapsed >= Config.MODEL_CONFIG['warmup_period']:
+                self.data_ready = True
+                logger.info("Warmup complete - Starting trading")
+                return True
+            return False
+        return True
