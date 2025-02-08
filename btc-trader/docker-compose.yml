@@ -34,16 +34,21 @@ services:
       POSITION_SIZE: ${POSITION_SIZE}
       MAX_LEVERAGE: ${MAX_LEVERAGE}
       SYMBOL: ${SYMBOL}
-      LOG_LEVEL: INFO #DEBUG/INFO/WARNING/ERROR/CRITICAL - INFO is General operational messages (should be default).
-      DEBUG_MODE: false # Enable verbose logging
+      LOG_LEVEL: INFO
+      DEBUG_MODE: false
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - trading-net
     volumes:
-      - .:/app
+      - .:/app  # Comment this out during initial build if needed
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "main.py", "--check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   timescaledb-data:
