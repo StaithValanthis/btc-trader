@@ -37,4 +37,3 @@ RUN useradd -m trader && \
 USER trader
 
 CMD ["python", "main.py"]
-

@@ -39,7 +39,7 @@ class Config:
         'min_training_samples': 500,
         'train_epochs': 50,
         'batch_size': 32,
-        'warmup_period': 1  # 30 minutes
+        'warmup_period': 10  # 30 minutes
     }
     
     TIMESCALE_CONFIG = {

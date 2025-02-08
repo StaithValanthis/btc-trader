@@ -42,7 +42,11 @@ class Database:
                     CREATE TABLE IF NOT EXISTS market_data (
                         time TIMESTAMPTZ NOT NULL PRIMARY KEY,
                         price DOUBLE PRECISION NOT NULL,
-                        volume DOUBLE PRECISION NOT NULL
+                        volume DOUBLE PRECISION NOT NULL,
+                        rsi DOUBLE PRECISION,
+                        macd DOUBLE PRECISION,
+                        signal DOUBLE PRECISION,
+                        volatility DOUBLE PRECISION
                     );
                 ''')
                 

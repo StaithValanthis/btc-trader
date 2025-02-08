@@ -41,3 +41,12 @@ def configure_logger():
 # Initialize the logger
 configure_logger()
 logger = structlog.get_logger()
+
+def progress_bar(percentage, bar_length=40):
+    """Generate a terminal-friendly progress bar."""
+    filled_length = int(bar_length * percentage / 100)
+    bar = "█" * filled_length + "-" * (bar_length - filled_length)
+
+    # Force UTF-8 encoding for terminal display
+    return f"[{bar}] {percentage:.1f}%"
+
