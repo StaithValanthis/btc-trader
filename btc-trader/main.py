@@ -1,24 +1,22 @@
 import asyncio
 import nest_asyncio
-from app.core import Database, BybitMarketData
-from app.services import TradeService
-from app.strategies.lstm_strategy import LSTMStrategy
-from app.utils.logger import configure_logger
+from app.core import Database
+from app import TradingBot
 
-configure_logger()
+nest_asyncio.apply()
 
 async def main():
-    await Database.initialize()
-    
-    market_data = BybitMarketData()
-    trade_service = TradeService()
-    strategy = LSTMStrategy(trade_service)
-
-    await asyncio.gather(
-        market_data.run(),  # Ensure this is awaited
-        strategy.run()
-    )
+    try:
+        # Initialize database
+        await Database.initialize()
+        
+        # Start trading bot
+        bot = TradingBot()
+        await bot.run()
+    except Exception as e:
+        print(f"Application failed: {str(e)}")
+    finally:
+        await Database.close()
 
 if __name__ == "__main__":
-    nest_asyncio.apply()
     asyncio.run(main())

@@ -10,78 +10,79 @@ class DataPreprocessor:
         self.lookback = lookback
         self.prediction_window = prediction_window
         self.scaler = MinMaxScaler(feature_range=(0, 1))
-
-    def _calculate_rsi(self, series, period=14):
-        """Calculate Relative Strength Index (RSI)."""
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    def _calculate_macd(self, series, fast=12, slow=26, signal=9):
-        """Calculate Moving Average Convergence Divergence (MACD)."""
-        exp1 = series.ewm(span=fast, adjust=False).mean()
-        exp2 = series.ewm(span=slow, adjust=False).mean()
-        macd = exp1 - exp2
-        signal_line = macd.ewm(span=signal, adjust=False).mean()
-        return macd, signal_line
-
-    def _calculate_bollinger_bands(self, series, window=20):
-        """Calculate Bollinger Bands."""
-        sma = series.rolling(window).mean()
-        std = series.rolling(window).std()
-        upper_band = sma + (std * 2)
-        lower_band = sma - (std * 2)
-        return upper_band, lower_band
-
-    def _calculate_atr(self, high, low, close, period=14):
-        """Calculate Average True Range (ATR)."""
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(period).mean()
-
-    def _calculate_vwap(self, close, volume):
-        """Calculate Volume-Weighted Average Price (VWAP)."""
-        return (close * volume).cumsum() / volume.cumsum()
+        self.required_columns = [
+            'open', 'high', 'low', 'close', 'volume',
+            'rsi', 'macd', 'signal', 'upper_band', 'lower_band', 'atr', 'vwap'
+        ]
 
     def create_features(self, df):
-        """Generate technical indicators."""
-        df = df.sort_index(ascending=True)
-        
-        df['rsi'] = self._calculate_rsi(df['close'], 14)
-        df['macd'], df['signal'] = self._calculate_macd(df['close'])
-        df['upper_band'], df['lower_band'] = self._calculate_bollinger_bands(df['close'])
-        df['atr'] = self._calculate_atr(df['high'], df['low'], df['close'])
-        df['vwap'] = self._calculate_vwap(df['close'], df['volume'])
-        df['returns'] = df['close'].pct_change()
-        
-        return df.dropna()
+        """Generate technical indicators with validation"""
+        try:
+            if df.empty:
+                return df
+                
+            # Ensure required base columns exist
+            if not all(col in df.columns for col in ['open', 'high', 'low', 'close', 'volume']):
+                raise ValueError("Missing required price columns")
+                
+            # Calculate indicators
+            df = df.sort_index(ascending=True)
+            
+            # RSI
+            df['rsi'] = self._calculate_rsi(df['close'], 14)
+            
+            # MACD
+            df['macd'], df['signal'] = self._calculate_macd(df['close'])
+            
+            # Bollinger Bands
+            df['upper_band'], df['lower_band'] = self._calculate_bollinger_bands(df['close'])
+            
+            # ATR
+            df['atr'] = self._calculate_atr(df['high'], df['low'], df['close'])
+            
+            # VWAP
+            df['vwap'] = self._calculate_vwap(df['close'], df['volume'])
+            
+            # Returns
+            df['returns'] = df['close'].pct_change()
+            
+            # Ensure all required columns are present
+            missing = set(self.required_columns) - set(df.columns)
+            if missing:
+                raise ValueError(f"Missing calculated columns: {missing}")
+                
+            return df.dropna()
+            
+        except Exception as e:
+            logger.error("Feature creation failed", error=str(e))
+            return pd.DataFrame()
 
     def prepare_data(self, df):
-        """Prepare data for LSTM model training."""
+        """Prepare data for LSTM model with validation"""
         try:
-            required_samples = self.lookback * 2
-            if df.empty or len(df) < required_samples:
-                #logger.warning(f"Insufficient data for training: {len(df)} rows available, {required_samples} needed.")
+            if df.empty:
                 return np.array([]), np.array([])
+                
+            # Ensure required columns
+            if not all(col in df.columns for col in self.required_columns):
+                raise ValueError("Missing required features")
+                
+            # Scale data
+            scaled_data = self.scaler.fit_transform(df[self.required_columns])
             
-            df = self.create_features(df)
-            df = df[['open', 'high', 'low', 'close', 'volume', 'rsi', 'macd', 'signal', 'upper_band', 'lower_band', 'atr', 'vwap']]
-            
-            scaled_data = self.scaler.fit_transform(df)
+            # Create sequences
             X, y = [], []
-            
             for i in range(self.lookback, len(scaled_data) - self.prediction_window):
                 X.append(scaled_data[i-self.lookback:i])
-                y.append(scaled_data[i+self.prediction_window, 3])  # Predict future 'close' price
-            
+                y.append(scaled_data[i+self.prediction_window, 3])  # Predict 'close' price
+                
             X, y = np.array(X), np.array(y)
-            logger.info(f"Data prepared successfully: X shape: {X.shape}, y shape: {y.shape}, available samples: {len(df)}")
+            
+            logger.info("Data prepared successfully", 
+                       samples=X.shape[0], 
+                       features=X.shape[2])
             return X, y
-        
+            
         except Exception as e:
             logger.error("Data preparation failed", error=str(e))
             return np.array([]), np.array([])

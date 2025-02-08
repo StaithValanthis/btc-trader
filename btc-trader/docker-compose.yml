@@ -23,29 +23,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      DB_HOST: postgres
-      DB_NAME: trading_bot
-      DB_USER: postgres
-      DB_PASSWORD: postgres
-      BYBIT_API_KEY: ${BYBIT_API_KEY}
-      BYBIT_API_SECRET: ${BYBIT_API_SECRET}
-      BYBIT_TESTNET: ${BYBIT_TESTNET}
-      POSITION_SIZE: ${POSITION_SIZE}
-      MAX_LEVERAGE: ${MAX_LEVERAGE}
-      SYMBOL: ${SYMBOL}
-      LOG_LEVEL: INFO
-      DEBUG_MODE: false
+    env_file: .env  # Ensure this line is present
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - trading-net
     volumes:
-      - .:/app  # Comment this out during initial build if needed
+      - .:/app
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "main.py", "--check"]
+      test: ["CMD", "python", "-c", "import asyncio; from app.debug.startup_check import StartupChecker; asyncio.run(StartupChecker.debug_check())"]
       interval: 30s
       timeout: 10s
       retries: 3

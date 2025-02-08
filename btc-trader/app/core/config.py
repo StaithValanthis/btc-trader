@@ -1,5 +1,9 @@
 from dotenv import load_dotenv
 import os
+from structlog import get_logger  # Add this import
+
+# Initialize logger
+logger = get_logger(__name__)  # Add this line
 
 load_dotenv()
 
@@ -7,11 +11,12 @@ def get_env_variable(name, default):
     """Safely get environment variable with proper type conversion."""
     value = os.getenv(name)
     if value is None or value.strip() == '':
+        logger.warning(f"Environment variable {name} is missing or empty, using default: {default}")
         return default
     try:
         return float(value)
     except ValueError:
-        return default
+        return value
 
 class Config:
     DB_CONFIG = {
@@ -47,3 +52,11 @@ class Config:
         'retention_period': '365 days',
         'chunk_time_interval': '1 day'
     }
+
+# Log the configuration for debugging
+logger.info("Loaded configuration", config={
+    "DB_CONFIG": {k: "****" if "password" in k else v for k, v in Config.DB_CONFIG.items()},
+    "BYBIT_CONFIG": {k: "****" if "secret" in k else v for k, v in Config.BYBIT_CONFIG.items()},
+    "TRADING_CONFIG": Config.TRADING_CONFIG,
+    "MODEL_CONFIG": Config.MODEL_CONFIG
+})

@@ -1,52 +1,45 @@
-import os
-import logging
-import structlog
-from structlog.dev import ConsoleRenderer
+import sys
+from structlog import get_logger
 
-def configure_logger():
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    debug_mode = os.getenv("DEBUG_MODE", "false").lower() == "true"
+logger = get_logger(__name__)
 
-    # Common processors for all environments
-    processors = [
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-    ]
+class ProgressBar:
+    def __init__(self, total, bar_length=40):
+        self.total = total
+        self.bar_length = bar_length
+        self.current = 0
+        self._printed = False
 
-    # Use different renderers based on DEBUG_MODE
-    if debug_mode:
-        # Human-readable output with Unicode support
-        processors.append(ConsoleRenderer(colors=True))
-    else:
-        # Structured JSON for production
-        processors.append(structlog.processors.JSONRenderer())
+    def update(self, progress):
+        """Update the progress bar"""
+        self.current = progress
+        self._render()
 
-    structlog.configure(
-        processors=processors,
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
+    def _render(self):
+        """Render the progress bar in the terminal"""
+        filled_length = int(self.bar_length * self.current / self.total)
+        bar = '█' * filled_length + '─' * (self.bar_length - filled_length)
+        percentage = min(100, (self.current / self.total) * 100)
+        
+        # Move cursor to the beginning of the line
+        sys.stdout.write('\r')
+        sys.stdout.write(f"[{bar}] {percentage:.1f}%")
+        sys.stdout.flush()
+        self._printed = True
 
-    # Configure standard logging
-    logging.basicConfig(
-        format="%(message)s" if debug_mode else None,
-        level=log_level,
-        handlers=[logging.StreamHandler()]
-    )
+    def clear(self):
+        """Clear the progress bar from the terminal"""
+        if self._printed:
+            sys.stdout.write('\r' + ' ' * (self.bar_length + 10) + '\r')
+            sys.stdout.flush()
+            self._printed = False
 
-# Initialize the logger
-configure_logger()
-logger = structlog.get_logger()
+    @staticmethod
+    def progress_bar(percentage, bar_length=40):
+        """Static method for generating progress bar strings"""
+        filled_length = int(bar_length * percentage / 100)
+        bar = '█' * filled_length + '─' * (self.bar_length - filled_length)
+        return f"[{bar}] {percentage:.1f}%"
 
-def progress_bar(percentage, bar_length=40):
-    """Generate a terminal-friendly progress bar."""
-    filled_length = int(bar_length * percentage / 100)
-    bar = "█" * filled_length + "-" * (bar_length - filled_length)
-
-    # Force UTF-8 encoding for terminal display
-    return f"[{bar}] {percentage:.1f}%"
-
+# Export the progress_bar function for backward compatibility
+progress_bar = ProgressBar.progress_bar

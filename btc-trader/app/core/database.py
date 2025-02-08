@@ -1,34 +1,61 @@
 import asyncpg
 from structlog import get_logger
 from app.core.config import Config
+import asyncio
 
 logger = get_logger(__name__)
 
 class Database:
     _pool = None
+    _connection_retries = 5
 
     @classmethod
     async def get_pool(cls):
         if not cls._pool:
-            cls._pool = await asyncpg.create_pool(
-                **Config.DB_CONFIG,
-                min_size=5,
-                max_size=20
-            )
+            for attempt in range(cls._connection_retries):
+                try:
+                    cls._pool = await asyncpg.create_pool(
+                        **Config.DB_CONFIG,
+                        min_size=5,
+                        max_size=20,
+                        timeout=30,
+                        command_timeout=60
+                    )
+                    logger.info("Database connection pool created")
+                    return cls._pool
+                except Exception as e:
+                    if attempt == cls._connection_retries - 1:
+                        logger.error("Max database connection attempts reached", error=str(e))
+                        raise
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Database connection failed, retrying in {wait_time} seconds...", 
+                                 attempt=attempt+1, error=str(e))
+                    await asyncio.sleep(wait_time)
         return cls._pool
 
     @classmethod
     async def execute(cls, query, *args):
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            return await conn.execute(query, *args)
+            try:
+                result = await conn.execute(query, *args)
+                logger.debug("Database query executed", query=query, args=args[:3])
+                return result
+            except Exception as e:
+                logger.error("Database query failed", query=query, error=str(e))
+                raise
 
     @classmethod
     async def fetch(cls, query, *args):
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
-
+            try:
+                result = await conn.fetch(query, *args)
+                logger.debug("Database fetch executed", query=query, args=args[:3])
+                return result
+            except Exception as e:
+                logger.error("Database fetch failed", query=query, error=str(e))
+                raise
     @classmethod
     async def initialize(cls):
         try:
@@ -161,4 +188,5 @@ class Database:
     async def close(cls):
         if cls._pool:
             await cls._pool.close()
-            logger.info("Database connection closed")
+            cls._pool = None
+            logger.info("Database connection pool closed")
