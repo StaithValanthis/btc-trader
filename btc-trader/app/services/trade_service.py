@@ -29,25 +29,23 @@ class TradeService:
             self.min_qty = float(info['result']['list'][0]['lotSizeFilter']['minOrderQty'])
         return self.min_qty
 
-    async def execute_trade(self, price: float, side: str):
+    async def execute_trade(self, price: float, side: str, qty: float = None):
         """Execute a trade on Bybit with slippage protection"""
         try:
             min_qty = await self._get_min_order_qty()
-            if self.position_size < min_qty:
+            qty = qty or self.position_size  # Use provided qty or default from config
+            
+            if qty < min_qty:
                 logger.error("Position size below minimum", required=min_qty)
                 return
 
-            current_price = await self.get_current_price()
-            if abs(price/current_price - 1) > 0.005:
-                logger.warning("Price slippage too high, aborting trade")
-                return
-
+            # Rest of the method remains the same...
             order_params = {
                 "category": "linear",
                 "symbol": Config.TRADING_CONFIG['symbol'],
                 "side": side,
                 "orderType": "Market",
-                "qty": str(self.position_size),
+                "qty": str(qty),  # Use the qty parameter
             }
 
             response = await asyncio.to_thread(

@@ -44,7 +44,8 @@ class Config:
         'min_training_samples': 500,
         'train_epochs': 50,
         'batch_size': 32,
-        'warmup_period': 10  # 30 minutes
+        'warmup_period': 1800,  # 30 minutes
+        'retrain_interval': 86400  # Retrain every 24 hours
     }
     
     TIMESCALE_CONFIG = {

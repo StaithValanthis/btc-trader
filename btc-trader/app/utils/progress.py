@@ -21,25 +21,24 @@ class ProgressBar:
         bar = '█' * filled_length + '─' * (self.bar_length - filled_length)
         percentage = min(100, (self.current / self.total) * 100)
         
-        # Move cursor to the beginning of the line
-        sys.stdout.write('\r')
-        sys.stdout.write(f"[{bar}] {percentage:.1f}%")
-        sys.stdout.flush()
+        # Write to stderr to avoid conflict with stdout logs
+        sys.stderr.write(f"\r[{bar}] {percentage:.1f}%")
+        sys.stderr.flush()
         self._printed = True
 
     def clear(self):
         """Clear the progress bar from the terminal"""
         if self._printed:
-            sys.stdout.write('\r' + ' ' * (self.bar_length + 10) + '\r')
-            sys.stdout.flush()
+            sys.stderr.write('\r' + ' ' * (self.bar_length + 10) + '\r')
+            sys.stderr.flush()
             self._printed = False
 
-    @staticmethod
-    def progress_bar(percentage, bar_length=40):
-        """Static method for generating progress bar strings"""
-        filled_length = int(bar_length * percentage / 100)
-        bar = '█' * filled_length + '─' * (self.bar_length - filled_length)
-        return f"[{bar}] {percentage:.1f}%"
+# Define the progress_bar function for backward compatibility
+def progress_bar(percentage, bar_length=40):
+    """Static method for generating progress bar strings"""
+    filled_length = int(bar_length * percentage / 100)
+    bar = '█' * filled_length + '─' * (bar_length - filled_length)
+    return f"[{bar}] {percentage:.1f}%"
 
-# Export the progress_bar function for backward compatibility
-progress_bar = ProgressBar.progress_bar
+# Export the ProgressBar class and progress_bar function
+__all__ = ['ProgressBar', 'progress_bar']

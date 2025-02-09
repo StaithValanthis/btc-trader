@@ -67,13 +67,14 @@ class Database:
                 # Create market_data table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS market_data (
-                        time TIMESTAMPTZ NOT NULL PRIMARY KEY,
+                        time TIMESTAMPTZ NOT NULL,
                         price DOUBLE PRECISION NOT NULL,
                         volume DOUBLE PRECISION NOT NULL,
                         rsi DOUBLE PRECISION,
                         macd DOUBLE PRECISION,
                         signal DOUBLE PRECISION,
-                        volatility DOUBLE PRECISION
+                        volatility DOUBLE PRECISION,
+                        UNIQUE (time, price, volume)  -- Composite key to avoid duplicates
                     );
                 ''')
                 

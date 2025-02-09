@@ -9,7 +9,8 @@ from app.core.config import Config
 logger = get_logger(__name__)
 
 class BybitMarketData:
-    def __init__(self, symbol: str = Config.TRADING_CONFIG['symbol']):
+    def __init__(self, strategy=None, symbol: str = Config.TRADING_CONFIG['symbol']):
+        self.strategy = strategy  # Store the strategy reference
         self.symbol = symbol
         self.ws = None
         self.running = False
@@ -79,33 +80,31 @@ class BybitMarketData:
         try:
             if not isinstance(trade_data, list):
                 trade_data = [trade_data]
-                
+
             logger.debug("Processing trades", count=len(trade_data))
-            
+
+            inserted_count = 0
             for trade in trade_data:
-                # Convert Bybit timestamp to UTC datetime
-                trade_time = datetime.fromtimestamp(
-                    int(trade['T']) / 1000, 
-                    tz=timezone.utc
-                )
-                
-                # Insert into database with error handling
-                result = await Database.execute('''
-                    INSERT INTO market_data (time, price, volume)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (time) DO NOTHING
-                ''', trade_time,
-                   float(trade['p']),
-                   float(trade['v']))
-                
-                if result == "INSERT 0 1":
-                    logger.debug("Inserted new trade", 
-                                time=trade_time.isoformat(),
-                                price=trade['p'],
-                                volume=trade['v'])
-                else:
-                    logger.debug("Skipped duplicate trade", time=trade_time.isoformat())
+                trade_time = datetime.fromtimestamp(int(trade['T']) / 1000, tz=timezone.utc)
+                try:
+                    # Insert without conflict checks
+                    result = await Database.execute('''
+                        INSERT INTO market_data (time, price, volume)
+                        VALUES ($1, $2, $3)
+                    ''', trade_time, float(trade['p']), float(trade['v']))
                     
+                    if result == "INSERT 0 1":
+                        inserted_count += 1
+                        logger.debug("Inserted new trade", time=trade_time.isoformat())
+                except Exception as e:
+                    logger.error("Failed to insert trade", error=str(e))
+
+            # Update progress bar after batch insert
+            if inserted_count > 0 and self.strategy and hasattr(self.strategy, 'progress_bar'):
+                count_result = await Database.fetch("SELECT COUNT(*) FROM market_data")
+                current_count = count_result[0]['count'] if count_result else 0
+                self.strategy.progress_bar.update(current_count)
+
         except Exception as e:
             logger.error("Trade processing failed", error=str(e))
 

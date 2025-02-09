@@ -11,9 +11,9 @@ nest_asyncio.apply()
 
 class TradingBot:
     def __init__(self):
-        self.bybit = BybitMarketData()
         self.trade_service = TradeService()
         self.strategy = LSTMStrategy(self.trade_service)
+        self.bybit = BybitMarketData(strategy=self.strategy)  # Pass strategy reference
         self.running = False
 
     async def run(self):

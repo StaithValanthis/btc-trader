@@ -10,7 +10,7 @@ from app.core import Config, Database
 from app.services.trade_service import TradeService
 from app.ml.data_preprocessor import DataPreprocessor
 from app.ml.lstm_model import LSTMModel
-from app.utils.progress import ProgressBar, progress_bar
+from app.utils.progress import ProgressBar
 
 logger = get_logger(__name__)
 
@@ -75,9 +75,9 @@ class LSTMStrategy:
             return False
 
     async def get_historical_data(self):
-        """Fetch and prepare training data with validation"""
+        """Fetch historical market data for training"""
         try:
-            # Get data from last 4 hours to ensure freshness
+            # Get data from the last 4 hours to ensure freshness
             time_threshold = datetime.utcnow() - timedelta(hours=4)
             
             records = await Database.fetch('''
@@ -121,80 +121,80 @@ class LSTMStrategy:
             logger.error("Data retrieval failed", error=str(e))
             return pd.DataFrame()
 
-    async def _validate_data(self, df):
-        """Validate data quality before processing"""
-        if df.empty:
-            return False
-            
-        # Check for required columns
-        required = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required):
-            logger.warning("Missing required columns", 
-                          missing=set(required) - set(df.columns))
-            return False
-            
-        # Check for sufficient data points
-        if len(df) < self.min_samples:
-            logger.warning("Insufficient data points", 
-                          available=len(df),
-                          required=self.min_samples)
-            return False
-            
-        # Check for NaN values
-        if df[required].isnull().any().any():
-            logger.warning("Data contains NaN values")
-            return False
-            
-        return True
+    async def log_market_analysis(self):
+        """Periodic market analysis logging"""
+        if time.time() - self.last_log_time >= 300:
+            try:
+                sentiment = await self.fetch_sentiment()
+                prediction = await self.get_prediction()
+                logger.info(
+                    "Market Snapshot",
+                    sentiment_score=sentiment,
+                    last_prediction=float(prediction[0]) if prediction else None,
+                    model_confidence=float(np.std(prediction)) if prediction else None
+                )
+                self.last_log_time = time.time()
+            except Exception as e:
+                logger.error("Market analysis failed", error=str(e))
+
+    async def fetch_sentiment(self):
+        """Fetch market sentiment data"""
+        # Implement actual sentiment API call here
+        return np.random.uniform(-1, 1)
 
     async def _check_data_availability(self):
-        """Comprehensive data readiness check"""
+        """Check data readiness with progress tracking."""
         if not self.data_ready:
             if not self.warmup_start_time:
                 self.warmup_start_time = time.time()
                 logger.info("Warmup phase started")
 
-            try:
-                # Get and validate data
-                df = await self.get_historical_data()
-                if not await self._validate_data(df):
-                    return False
-                    
-                # Prepare features
-                features_df = self.preprocessor.create_features(df)
-                if features_df.empty:
-                    logger.warning("Feature engineering failed")
-                    return False
-                    
-                # Track progress
-                valid_samples = len(features_df)
-                total_samples = await self._get_total_data_count()
-                
-                time_progress = ((time.time() - self.warmup_start_time) / 
-                               Config.MODEL_CONFIG['warmup_period']) * 100
-                data_progress = (valid_samples / self.min_samples) * 100
-                overall_progress = min(data_progress, time_progress)
-                
-                # Update static progress bar
-                self.progress_bar.update(valid_samples)
-                
-                if valid_samples >= self.min_samples and time_progress >= 100:
-                    self.data_ready = True
-                    self.progress_bar.clear()  # Clear the progress bar when done
-                    logger.info("Warmup complete - Starting trading")
-                    return True
-                    
-            except Exception as e:
-                logger.error("Data check failed", error=str(e))
+            # Get the current data count
+            count_result = await Database.fetch("SELECT COUNT(*) FROM market_data")
+            current_count = count_result[0]['count'] if count_result else 0
+
+            # Update progress bar
+            self.progress_bar.update(current_count)
+
+            # Check if we have enough data and warmup time has passed
+            if current_count >= self.min_samples:
+                self.data_ready = True
                 self.progress_bar.clear()
-                
+                logger.info("Warmup complete - Starting trading")
+                return True
+
             return False
         return True
 
-    async def _get_total_data_count(self):
-        """Get total raw data points in database"""
-        result = await Database.fetch("SELECT COUNT(*) FROM market_data")
-        return result[0]['count'] if result else 0
+    async def run(self):
+        """Main strategy loop"""
+        logger.info("Strategy thread started")
+        while True:
+            try:
+                # Data readiness check
+                if not await self._check_data_availability():
+                    await asyncio.sleep(30)
+                    continue
+
+                # Regular retraining
+                if self._should_retrain():
+                    await self.retrain_model()
+
+                # Trading operations
+                await self.execute_trades()
+                await self.log_market_analysis()
+
+                await asyncio.sleep(60)
+
+            except Exception as e:
+                logger.error("Strategy loop error", error=str(e))
+                await asyncio.sleep(10)
+
+    def _should_retrain(self):
+        """Determine if retraining is needed"""
+        if not self.last_retrain:
+            return True
+        return (time.time() - self.last_retrain) > Config.MODEL_CONFIG['retrain_interval']
 
     async def retrain_model(self):
         """Robust model retraining with atomic operations"""
@@ -285,57 +285,6 @@ class LSTMStrategy:
         risk_percent = 0.02
         dollar_risk = account_balance * risk_percent
         return min(dollar_risk / current_price, Config.TRADING_CONFIG['position_size'])
-
-    async def run(self):
-        """Main strategy loop"""
-        logger.info("Strategy thread started")
-        while True:
-            try:
-                # Data readiness check
-                if not await self._check_data_availability():
-                    await asyncio.sleep(30)
-                    continue
-                    
-                # Regular retraining
-                if self._should_retrain():
-                    await self.retrain_model()
-                    
-                # Trading operations
-                await self.execute_trades()
-                await self.log_market_analysis()
-                
-                await asyncio.sleep(60)
-                
-            except Exception as e:
-                logger.error("Strategy loop error", error=str(e))
-                await asyncio.sleep(10)
-
-    def _should_retrain(self):
-        """Determine if retraining is needed"""
-        if not self.last_retrain:
-            return True
-        return (time.time() - self.last_retrain) > Config.MODEL_CONFIG['retrain_interval']
-
-    async def log_market_analysis(self):
-        """Periodic market analysis logging"""
-        if time.time() - self.last_log_time >= 300:
-            try:
-                sentiment = await self.fetch_sentiment()
-                prediction = await self.get_prediction()
-                logger.info(
-                    "Market Snapshot",
-                    sentiment_score=sentiment,
-                    last_prediction=float(prediction[0]) if prediction else None,
-                    model_confidence=float(np.std(prediction)) if prediction else None
-                )
-                self.last_log_time = time.time()
-            except Exception as e:
-                logger.error("Market analysis failed", error=str(e))
-
-    async def fetch_sentiment(self):
-        """Fetch market sentiment data"""
-        # Implement actual sentiment API call here
-        return np.random.uniform(-1, 1)
 
     async def get_prediction(self):
         """Get model prediction with validation"""
