@@ -1,11 +1,21 @@
-# app/core/config.py
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
 from structlog import get_logger
 
 logger = get_logger(__name__)
 
 load_dotenv()
+
+def get_env_variable(name, default):
+    """Safely get environment variable with proper type conversion."""
+    value = os.getenv(name)
+    if value is None or value.strip() == '':
+        logger.warning(f"Environment variable {name} is missing or empty, using default: {default}")
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return value
 
 class Config:
     DB_CONFIG = {
@@ -23,16 +33,37 @@ class Config:
     
     TRADING_CONFIG = {
         'symbol': os.getenv('SYMBOL', 'BTCUSDT'),
-        'position_size': float(os.getenv('POSITION_SIZE', 0.001)),
-        'max_leverage': float(os.getenv('MAX_LEVERAGE', 10)),
-        'retrain_interval': 86400  # Retrain every 24 hours
+        'position_size': get_env_variable('POSITION_SIZE', 0.001),
+        'max_leverage': get_env_variable('MAX_LEVERAGE', 10),
     }
     
     MODEL_CONFIG = {
         'lookback_window': 60,
-        'min_training_samples': 500,
+        'min_training_samples': 1000,
         'train_epochs': 50,
         'batch_size': 32,
-        'warmup_period': 1800,  # 30 minutes
-        'retrain_interval': 86400  # Retrain every 24 hours
+        'warmup_period': 1800,
+        'retrain_interval': 86400,
+        'use_rolling_window': True,
+        'rolling_window_hours': 48,
+        'enable_hyperparam_tuning': False
     }
+    
+    TIMESCALE_CONFIG = {
+        'compression_interval': '7 days',
+        'retention_period': '365 days',
+        'chunk_time_interval': '1 day'
+    }
+
+logger.info("Loaded configuration", config={
+    "DB_CONFIG": {
+        k: "****" if "password" in k else v
+        for k, v in Config.DB_CONFIG.items()
+    },
+    "BYBIT_CONFIG": {
+        k: "****" if "secret" in k else v
+        for k, v in Config.BYBIT_CONFIG.items()
+    },
+    "TRADING_CONFIG": Config.TRADING_CONFIG,
+    "MODEL_CONFIG": Config.MODEL_CONFIG
+})
