@@ -52,7 +52,7 @@ class DataPreprocessor:
         needed_1m = ['open_1m', 'high_1m', 'low_1m', 'close_1m', 'volume_1m']
         if not all(c in df.columns for c in needed_1m):
             logger.warning("Missing 1m columns for indicator creation.")
-            return
+            return df
         
         # RSI for 1m close
         df['rsi_1m'] = self._calculate_rsi(df['close_1m'], 14)
@@ -79,7 +79,7 @@ class DataPreprocessor:
         needed_5m = ['open_5m', 'high_5m', 'low_5m', 'close_5m', 'volume_5m']
         if not all(c in df.columns for c in needed_5m):
             logger.warning("Missing 5m columns for indicator creation.")
-            return
+            return df
 
         df['ema9_5m'] = df['close_5m'].ewm(span=9, adjust=False).mean()
         df['ema21_5m'] = df['close_5m'].ewm(span=21, adjust=False).mean()

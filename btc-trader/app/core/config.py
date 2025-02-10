@@ -39,13 +39,13 @@ class Config:
  
     MODEL_CONFIG = {
         'lookback_window': 60,
-        'min_training_samples': 1,     # only need 15 bars to start
+        'min_training_samples': 15,     # only need 15 bars to start
         'train_epochs': 20,            # reduce epochs for quicker training
         'batch_size': 16,
-        'warmup_period': 60,          # 15 minutes = 900s
+        'warmup_period': 900,          # 15 minutes = 900s
         'retrain_interval': 86400,     # daily retraining
         'use_rolling_window': True,
-        'rolling_window_hours': 0.01,  # 15 minutes
+        'rolling_window_hours': 0.25,  # 15 minutes
         'enable_hyperparam_tuning': False
     }    
     
