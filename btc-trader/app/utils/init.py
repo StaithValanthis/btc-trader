@@ -11,8 +11,8 @@ logger = get_logger(__name__)
 class TradingBot:
     def __init__(self):
         self.trade_service = TradeService()
-        self.market_data = BybitMarketData()
         self.strategy = LSTMStrategy(self.trade_service)
+        self.bybit = BybitMarketData(strategy=self.strategy)  # Pass strategy here
         self.running = False
 
     async def run(self):
