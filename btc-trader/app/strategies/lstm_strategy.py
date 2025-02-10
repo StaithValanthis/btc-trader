@@ -1,3 +1,5 @@
+# File: app/strategies/lstm_strategy.py
+
 import asyncio
 import time
 import pandas as pd
@@ -20,16 +22,11 @@ class LSTMStrategy:
         self.trade_service = trade_service
         self.preprocessor = DataPreprocessor(
             lookback=Config.MODEL_CONFIG['lookback_window'],
-            prediction_window=5  # you can adjust
+            prediction_window=5
         )
 
-        # Because we're merging 1m & 5m data, total features might be large.
-        # We'll figure out the shape after we create the data the first time,
-        # but let's keep a "max" placeholder for now. This can be replaced once we know.
-        # A quick approach is to set something large, or do a dynamic build in `_initialize_model()`.
+        # We'll build a placeholder LSTM with a maximum shape.
         self.input_shape = (Config.MODEL_CONFIG['lookback_window'], len(self.preprocessor.required_columns))
-
-        # We create a placeholder model object:
         self.model = LSTMModel(self.input_shape)
         self.model_loaded = False
 
@@ -47,16 +44,13 @@ class LSTMStrategy:
         logger.info("Strategy thread started")
         while True:
             try:
-                # Data readiness check
                 if not await self._check_data_availability():
                     await asyncio.sleep(30)
                     continue
 
-                # Periodic retraining (every 24h)
                 if self._should_retrain():
                     await self.retrain_model()
 
-                # Trading operations
                 await self.execute_trades()
                 await self.log_market_analysis()
 
@@ -67,18 +61,15 @@ class LSTMStrategy:
                 await asyncio.sleep(10)
 
     def _should_retrain(self):
-        """Determine if retraining is needed (every 24 hours by default)."""
         if not self.last_retrain:
             return True
         return (time.time() - self.last_retrain) > Config.MODEL_CONFIG['retrain_interval']
 
     async def retrain_model(self):
-        """Robust model retraining with atomic operations."""
         temp_path = None
         try:
             logger.info("Starting model retraining cycle")
 
-            # 1. Data collection
             df_merged = await self.get_multi_timeframe_data()
             if len(df_merged) < self.min_samples:
                 logger.warning("Skipping retrain - insufficient data",
@@ -86,32 +77,28 @@ class LSTMStrategy:
                                required=self.min_samples)
                 return
 
-            # 2. Data preparation
             X, y = self.preprocessor.prepare_data(df_merged)
             if X.shape[0] == 0:
                 logger.error("Data preparation failed (no training samples)")
                 return
 
-            # Rebuild the model if input shape changed
+            # If shape changed, rebuild the model
             if X.shape[1:] != self.model.model.input_shape[1:]:
                 logger.info(f"Rebuilding LSTM model to match new shape {X.shape[1:]}")
                 self.model = LSTMModel(X.shape[1:])
 
-            # 2.5 (optional) Hyperparameter Tuning
             if Config.MODEL_CONFIG['enable_hyperparam_tuning']:
                 logger.info("Running hyperparameter tuning...")
                 self.model.hyperparameter_tuning(X, y)
-                # Rebuild final best model or re-load from tuner. For brevity, we skip details here.
 
-            # 3. Model training
             logger.info("Training model", samples=X.shape[0])
             self.model.train(
-                X, y, 
-                epochs=Config.MODEL_CONFIG['train_epochs'], 
+                X, y,
+                epochs=Config.MODEL_CONFIG['train_epochs'],
                 batch_size=Config.MODEL_CONFIG['batch_size']
             )
 
-            # 4. Model saving
+            # Save
             temp_path = "lstm_model_temp.h5"
             final_path = "lstm_model.h5"
             self.model.save(temp_path)
@@ -119,12 +106,11 @@ class LSTMStrategy:
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024:
                 raise IOError("Model save verification failed")
 
-            # Atomic replacement
             if os.path.exists(final_path):
                 os.remove(final_path)
             os.rename(temp_path, final_path)
 
-            # 5. Reload to confirm
+            # Reload
             self.model.load(final_path)
             self.model_loaded = True
             logger.info("Model update successful")
@@ -141,7 +127,6 @@ class LSTMStrategy:
             self.last_retrain = time.time()
 
     async def execute_trades(self):
-        """Trade execution with model validation."""
         try:
             if not self.model_loaded:
                 logger.warning("Skipping trades - model not loaded")
@@ -156,8 +141,7 @@ class LSTMStrategy:
                 return
 
             position_size = self._calculate_position_size(current_price)
-
-            # Simple threshold logic:
+            # Simple threshold logic
             if prediction[0] > current_price * 1.002:
                 await self.trade_service.execute_trade(current_price, 'Buy', position_size)
             elif prediction[0] < current_price * 0.998:
@@ -167,7 +151,6 @@ class LSTMStrategy:
             logger.error("Trade execution error", error=str(e))
 
     async def log_market_analysis(self):
-        """Periodic market analysis logging."""
         if time.time() - self.last_log_time >= 300:
             try:
                 sentiment = await self.fetch_sentiment()
@@ -183,11 +166,9 @@ class LSTMStrategy:
                 logger.error("Market analysis failed", error=str(e))
 
     async def fetch_sentiment(self):
-        """Fetch market sentiment data (placeholder)."""
         return np.random.uniform(-1, 1)
 
     async def _check_data_availability(self):
-        """Check data readiness with progress tracking."""
         if not self.data_ready:
             if not self.warmup_start_time:
                 self.warmup_start_time = time.time()
@@ -207,7 +188,6 @@ class LSTMStrategy:
         return True
 
     async def get_prediction(self):
-        """Use the model to generate a next price prediction from the merged dataset."""
         try:
             if not self.model_loaded:
                 return None
@@ -227,28 +207,26 @@ class LSTMStrategy:
             return None
 
     def _calculate_position_size(self, current_price):
-        """Basic risk-adjusted position sizing."""
-        account_balance = 10000  # Replace with real data from exchange
+        account_balance = 10000  # Replace with actual exchange data
         risk_percent = 0.02
         dollar_risk = account_balance * risk_percent
         return min(dollar_risk / current_price, Config.TRADING_CONFIG['position_size'])
 
-    # -------------------------------------------------------------
-    # Fetching 1m & 5m data from your database & merging
-    # -------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # Updated Multi-Timeframe Data Fetch with 1m priority
+    # ----------------------------------------------------------------
     async def get_multi_timeframe_data(self):
         """
-        Fetch 1-min bars and 5-min bars from the last X hours/days,
-        merge them, then run the feature calculations.
+        Fetch 1-minute bars from the last X hours.
+        Attempt 5-minute bars. If 5m is empty, proceed with 1m only.
+        Then run the 1m/5m indicators if data is present.
         """
-        # Decide how far back to fetch based on rolling_window or entire history
         if Config.MODEL_CONFIG['use_rolling_window']:
             time_threshold = datetime.utcnow() - timedelta(hours=Config.MODEL_CONFIG['rolling_window_hours'])
         else:
-            # Grab a large window if not using rolling
             time_threshold = datetime.utcnow() - timedelta(days=90)
 
-        # 1. Fetch 1-minute bars
+        # 1) Fetch 1-minute bars
         records_1m = await Database.fetch('''
             SELECT 
                 time_bucket('1 minute', time) AS bucket,
@@ -264,18 +242,21 @@ class LSTMStrategy:
         ''', time_threshold)
 
         df1m = pd.DataFrame([dict(r) for r in records_1m])
-        if not df1m.empty:
-            df1m['bucket'] = pd.to_datetime(df1m['bucket'])
-            df1m.set_index('bucket', inplace=True)
-            df1m.rename(columns={
-                'open': 'open_1m',
-                'high': 'high_1m',
-                'low': 'low_1m',
-                'close': 'close_1m',
-                'volume': 'volume_1m'
-            }, inplace=True)
+        if df1m.empty:
+            logger.warning("Not enough 1-minute data yet.")
+            return pd.DataFrame()
 
-        # 2. Fetch 5-minute bars
+        df1m['bucket'] = pd.to_datetime(df1m['bucket'])
+        df1m.set_index('bucket', inplace=True)
+        df1m.rename(columns={
+            'open': 'open_1m',
+            'high': 'high_1m',
+            'low': 'low_1m',
+            'close': 'close_1m',
+            'volume': 'volume_1m'
+        }, inplace=True)
+
+        # 2) Attempt fetching 5-minute bars
         records_5m = await Database.fetch('''
             SELECT 
                 time_bucket('5 minutes', time) AS bucket,
@@ -291,26 +272,30 @@ class LSTMStrategy:
         ''', time_threshold)
 
         df5m = pd.DataFrame([dict(r) for r in records_5m])
-        if not df5m.empty:
-            df5m['bucket'] = pd.to_datetime(df5m['bucket'])
-            df5m.set_index('bucket', inplace=True)
-            df5m.rename(columns={
-                'open': 'open_5m',
-                'high': 'high_5m',
-                'low': 'low_5m',
-                'close': 'close_5m',
-                'volume': 'volume_5m'
-            }, inplace=True)
+        if df5m.empty:
+            logger.warning("5-minute data not yet available; using only 1-minute bars.")
+            # Calculate 1m indicators only
+            self.preprocessor.create_features_for_1m(df1m)
+            if df1m.empty:
+                logger.warning("After 1m indicator calculation, no data remains.")
+                return pd.DataFrame()
+            logger.info("Returning 1-minute only data", samples=len(df1m))
+            return df1m
 
-        if df1m.empty or df5m.empty:
-            logger.warning("Not enough data in 1m or 5m timeframe.")
-            return pd.DataFrame()
+        df5m['bucket'] = pd.to_datetime(df5m['bucket'])
+        df5m.set_index('bucket', inplace=True)
+        df5m.rename(columns={
+            'open': 'open_5m',
+            'high': 'high_5m',
+            'low': 'low_5m',
+            'close': 'close_5m',
+            'volume': 'volume_5m'
+        }, inplace=True)
 
-        # 3. Merge timeframes
+        # 3) Merge 1m & 5m
         df_merged = self.preprocessor.merge_timeframes(df1m, df5m)
 
-        # 4. Create indicators for each timeframe
-        #    We'll do 1m indicators first, then 5m.
+        # 4) Indicators for each timeframe
         self.preprocessor.create_features_for_1m(df_merged)
         self.preprocessor.create_features_for_5m(df_merged)
 

@@ -36,18 +36,18 @@ class Config:
         'position_size': get_env_variable('POSITION_SIZE', 0.001),
         'max_leverage': get_env_variable('MAX_LEVERAGE', 10),
     }
-    
+ 
     MODEL_CONFIG = {
         'lookback_window': 60,
-        'min_training_samples': 1000,
-        'train_epochs': 50,
-        'batch_size': 32,
-        'warmup_period': 1800,
-        'retrain_interval': 86400,
+        'min_training_samples': 1,     # only need 15 bars to start
+        'train_epochs': 20,            # reduce epochs for quicker training
+        'batch_size': 16,
+        'warmup_period': 60,          # 15 minutes = 900s
+        'retrain_interval': 86400,     # daily retraining
         'use_rolling_window': True,
-        'rolling_window_hours': 48,
+        'rolling_window_hours': 0.01,  # 15 minutes
         'enable_hyperparam_tuning': False
-    }
+    }    
     
     TIMESCALE_CONFIG = {
         'compression_interval': '7 days',

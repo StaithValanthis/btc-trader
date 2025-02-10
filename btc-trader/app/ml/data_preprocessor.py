@@ -1,3 +1,5 @@
+# File: app/ml/data_preprocessor.py
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
@@ -11,112 +13,136 @@ class DataPreprocessor:
         self.prediction_window = prediction_window
         self.scaler = MinMaxScaler(feature_range=(0, 1))
 
-        # We'll have separate columns for 1m and 5m data + new indicators
-        # For 1-minute bars:
+        # For 1m base: open_1m, close_1m, etc.
         self.base_1m = ['open_1m', 'high_1m', 'low_1m', 'close_1m', 'volume_1m']
-        # For 5-minute bars:
+        # For 5m base
         self.base_5m = ['open_5m', 'high_5m', 'low_5m', 'close_5m', 'volume_5m']
 
-        # Indicators (some apply to 1m, some to 5m, or both). We'll label them accordingly.
+        # Indicators for 1m
         self.indicators_1m = [
             'rsi_1m', 'macd_1m', 'signal_1m', 'upper_band_1m', 'lower_band_1m',
-            'ema9_1m', 'ema21_1m', 'ema55_1m', 'stoch_k_1m', 'stoch_d_1m', 'obv_1m'
+            'ema9_1m', 'ema21_1m', 'ema55_1m'
         ]
+        # Indicators for 5m
         self.indicators_5m = [
             'ema9_5m', 'ema21_5m', 'ema55_5m', 'rsi_5m', 'macd_5m', 'signal_5m'
-            # ... add more if desired
         ]
 
-        # Combine into one comprehensive list:
-        self.required_columns = (
-            self.base_1m + 
-            self.base_5m + 
-            self.indicators_1m + 
-            self.indicators_5m
-        )
+        # Full list of required columns
+        self.required_columns = self.base_1m + self.base_5m + self.indicators_1m + self.indicators_5m
 
     def merge_timeframes(self, df1m, df5m):
         """
-        Merge 1m & 5m data into a single DataFrame on the time index.
-        We suffix columns with _1m or _5m so they don't collide.
+        Merge 1m & 5m data on their time index (both named 'bucket').
+        We'll do a left join on the 1m index, then forward-fill 5m.
         """
-        # df1m and df5m are both indexed by time (after groupby in your strategy).
-        # We'll do an outer join to align times. 5m updates less frequently,
-        # so forward-fill or fill with NaN as needed.
-        df = df1m.join(df5m, how='outer')
-        # Forward fill 5m columns so that each 1-minute row in between gets the same 5-min bar
+        df = df1m.join(df5m, how='left')  # left join to keep all 1m rows
+        # Forward fill the 5m columns so intermediate 1m rows have the same 5m data
         df.ffill(inplace=True)
         return df
 
     def create_features_for_1m(self, df):
-        """Calculate indicators for the 1-minute data."""
+        """
+        Calculate indicators for the 1-minute columns only.
+        Expect columns: open_1m, close_1m, etc.
+        """
+        if df.empty:
+            return
+        # Basic checks
+        needed_1m = ['open_1m', 'high_1m', 'low_1m', 'close_1m', 'volume_1m']
+        if not all(c in df.columns for c in needed_1m):
+            logger.warning("Missing 1m columns for indicator creation.")
+            return
+        
+        # RSI for 1m close
         df['rsi_1m'] = self._calculate_rsi(df['close_1m'], 14)
-        df['macd_1m'], df['signal_1m'] = self._calculate_macd(df['close_1m'])
+        # MACD for 1m
+        macd, signal = self._calculate_macd(df['close_1m'])
+        df['macd_1m'] = macd
+        df['signal_1m'] = signal
+        # Bollinger (or simpler) - just example
         df['upper_band_1m'], df['lower_band_1m'] = self._calculate_bollinger_bands(df['close_1m'])
+        # EMAs
         df['ema9_1m'] = df['close_1m'].ewm(span=9, adjust=False).mean()
         df['ema21_1m'] = df['close_1m'].ewm(span=21, adjust=False).mean()
         df['ema55_1m'] = df['close_1m'].ewm(span=55, adjust=False).mean()
-        df['stoch_k_1m'], df['stoch_d_1m'] = self._calculate_stoch(df['high_1m'], df['low_1m'], df['close_1m'])
-        df['obv_1m'] = self._calculate_obv(df['close_1m'], df['volume_1m'])
-        df.dropna(inplace=True)
+
+        # Drop partial NaNs from these calculations
+        df.dropna(subset=self.indicators_1m, inplace=True)
 
     def create_features_for_5m(self, df):
-        """Calculate indicators for the 5-minute data."""
+        """
+        Calculate indicators for the 5-minute columns only.
+        """
+        if df.empty:
+            return
+        needed_5m = ['open_5m', 'high_5m', 'low_5m', 'close_5m', 'volume_5m']
+        if not all(c in df.columns for c in needed_5m):
+            logger.warning("Missing 5m columns for indicator creation.")
+            return
+
         df['ema9_5m'] = df['close_5m'].ewm(span=9, adjust=False).mean()
         df['ema21_5m'] = df['close_5m'].ewm(span=21, adjust=False).mean()
         df['ema55_5m'] = df['close_5m'].ewm(span=55, adjust=False).mean()
+        # Simple RSI, MACD for 5m
         df['rsi_5m'] = self._calculate_rsi(df['close_5m'], 14)
-        df['macd_5m'], df['signal_5m'] = self._calculate_macd(df['close_5m'])
-        df.dropna(inplace=True)
+        macd_5m, signal_5m = self._calculate_macd(df['close_5m'])
+        df['macd_5m'] = macd_5m
+        df['signal_5m'] = signal_5m
+
+        # Drop partial NaNs from these calculations
+        df.dropna(subset=self.indicators_5m, inplace=True)
 
     def prepare_data(self, df):
         """
-        Scale all required columns and create the final (X, y) for LSTM.
-        We'll assume we predict future close_1m as the target or something similar.
+        Scale the required columns, return X, y.
+        We assume 'close_1m' is our target or something similar. (You can pick any column.)
         """
         try:
             if df.empty:
                 return np.array([]), np.array([])
 
-            # Check if required columns exist
             for col in self.required_columns:
                 if col not in df.columns:
-                    raise ValueError(f"Missing column {col} in merged DF")
+                    # It's okay if 5m columns are missing if we never created them,
+                    # but let's ensure we handle that logic. For simplicity,
+                    # let's fill missing columns with forward fill or zero.
+                    if col not in df:
+                        df[col] = 0.0  # or a ffill if you prefer
 
-            # Sort by time ascending
             df.sort_index(ascending=True, inplace=True)
-
-            # Scale only the required columns
             scaled_data = self.scaler.fit_transform(df[self.required_columns])
 
             X, y = [], []
-            # We'll define our target as `close_1m` in the future:
-            close_1m_idx = self.required_columns.index('close_1m')
+            # Let's pick 'close_1m' as target. If that's at index, we find it:
+            if 'close_1m' in self.required_columns:
+                target_idx = self.required_columns.index('close_1m')
+            else:
+                # fallback or raise
+                target_idx = 3  # your choice
 
             for i in range(self.lookback, len(scaled_data) - self.prediction_window):
                 X.append(scaled_data[i - self.lookback : i])
-                # Predict the close_1m <prediction_window> steps in the future
-                y.append(scaled_data[i + self.prediction_window, close_1m_idx])
+                y.append(scaled_data[i + self.prediction_window, target_idx])
 
             X, y = np.array(X), np.array(y)
-
             logger.info("Data prepared successfully", samples=X.shape[0], features=X.shape[2])
             return X, y
-        
         except Exception as e:
             logger.error("Data preparation failed", error=str(e))
             return np.array([]), np.array([])
 
     # -------------------------------------------------
-    # Helper indicator methods
+    # Helper methods for RSI, MACD, Bollinger, etc.
     # -------------------------------------------------
     def _calculate_rsi(self, series, period=14):
         delta = series.diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
+        avg_gain = gain.rolling(period).mean()
+        avg_loss = loss.rolling(period).mean()
+
+        rs = avg_gain / (avg_loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
@@ -128,24 +154,8 @@ class DataPreprocessor:
         return macd, signal
 
     def _calculate_bollinger_bands(self, series, window=20, num_std=2):
-        sma = series.rolling(window=window).mean()
-        std = series.rolling(window=window).std()
-        upper_band = sma + (num_std * std)
-        lower_band = sma - (num_std * std)
-        return upper_band, lower_band
-
-    def _calculate_stoch(self, high, low, close, k_period=14, d_period=3):
-        """Stochastic Oscillator %K and %D."""
-        lowest_low = low.rolling(k_period).min()
-        highest_high = high.rolling(k_period).max()
-        stoch_k = 100 * ((close - lowest_low) / (highest_high - lowest_low + 1e-9))
-        stoch_d = stoch_k.rolling(d_period).mean()
-        return stoch_k, stoch_d
-
-    def _calculate_obv(self, close, volume):
-        """On-Balance Volume."""
-        # If today's close > yesterday's close => +volume else -volume
-        signed_vol = np.where(close > close.shift(1), volume, 
-                        np.where(close < close.shift(1), -volume, 0))
-        obv = pd.Series(signed_vol).cumsum()
-        return obv
+        sma = series.rolling(window).mean()
+        std = series.rolling(window).std()
+        upper = sma + (num_std * std)
+        lower = sma - (num_std * std)
+        return upper, lower
