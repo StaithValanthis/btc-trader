@@ -1,130 +1,86 @@
-import json
+# app/core/bybit_client.py
 import asyncio
+import json
 import websockets
-from structlog import get_logger
 from datetime import datetime, timezone
-from app.core.database import Database
-from app.core.config import Config
+from structlog import get_logger
+from app.core import Database, Config
 
 logger = get_logger(__name__)
 
 class BybitMarketData:
-    def __init__(self, strategy=None, symbol: str = Config.TRADING_CONFIG['symbol']):
-        self.strategy = strategy  # Store the strategy reference
-        self.symbol = symbol
+    def __init__(self):
         self.ws = None
         self.running = False
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5
-        self.last_message_time = None
+        self.max_reconnects = 5
+
+    async def initialize(self):
+        """Initialize WebSocket connection"""
+        await self._connect_websocket()
 
     async def _connect_websocket(self):
+        """Establish WebSocket connection with retries"""
         try:
             self.ws = await websockets.connect(
                 "wss://stream.bybit.com/v5/public/linear",
                 ping_interval=30,
-                ping_timeout=10,
-                extra_headers={"User-Agent": "BTC-Trader/1.0"}
+                ping_timeout=10
             )
             
-            # Subscribe to correct trade stream format
-            subscription = {
+            # Subscribe to trade stream
+            await self.ws.send(json.dumps({
                 "op": "subscribe",
-                "args": [f"publicTrade.{self.symbol}"]
-            }
-            await self.ws.send(json.dumps(subscription))
-            
-            # Verify subscription response
-            response = await self.ws.recv()
-            logger.debug("Subscription response", response=json.loads(response))
-            
-            # Start listening task
-            asyncio.create_task(self._listen())
+                "args": [f"publicTrade.{Config.TRADING_CONFIG['symbol']}"]
+            }))
+            await self.ws.recv()  # Confirm subscription
             self.reconnect_attempts = 0
-            logger.info("WebSocket connected successfully")
-            
+            logger.info("WebSocket connected")
+
         except Exception as e:
             logger.error("WebSocket connection failed", error=str(e))
             await self._reconnect()
 
-    async def _reconnect(self):
-        if self.reconnect_attempts < self.max_reconnect_attempts:
-            self.reconnect_attempts += 1
-            wait_time = min(30, 2 ** self.reconnect_attempts)
-            logger.warning(f"Reconnecting attempt {self.reconnect_attempts} in {wait_time}s...")
-            await asyncio.sleep(wait_time)
-            await self._connect_websocket()
-        else:
-            logger.error("Max reconnect attempts reached")
-            self.running = False
+    async def _process_message(self, trade_data):
+        """Process incoming market data"""
+        try:
+            # Handle both single trades and batch trades
+            trades = trade_data if isinstance(trade_data, list) else [trade_data]
+            
+            values = [
+                (datetime.fromtimestamp(int(trade['T'])/1000, tz=timezone.utc),
+                 float(trade['p']),
+                 float(trade['v']))
+                for trade in trades
+            ]
 
-    async def _listen(self):
+            await Database.execute('''
+                INSERT INTO market_data (time, price, volume)
+                SELECT * FROM UNNEST($1::timestamptz[], $2::float8[], $3::float8[])
+                ON CONFLICT (time, price, volume) DO NOTHING
+            ''', [v[0] for v in values], [v[1] for v in values], [v[2] for v in values])
+
+        except Exception as e:
+            logger.error("Data processing error", error=str(e))
+
+    async def run(self):
+        """Main data ingestion loop"""
+        self.running = True
         while self.running:
             try:
                 message = await self.ws.recv()
-                self.last_message_time = datetime.now(timezone.utc)
                 data = json.loads(message)
-                
-                if 'topic' in data and data['topic'] == f"publicTrade.{self.symbol}":
+                if 'topic' in data and data['topic'].startswith('publicTrade'):
                     await self._process_message(data['data'])
-                else:
-                    logger.debug("Received non-trade message", message=data)
-                    
             except websockets.ConnectionClosed:
                 logger.warning("WebSocket connection closed")
                 await self._reconnect()
             except Exception as e:
                 logger.error("Message processing error", error=str(e))
 
-    async def _process_message(self, trade_data):
-        try:
-            if not isinstance(trade_data, list):
-                trade_data = [trade_data]
-
-            logger.debug("Processing trades", count=len(trade_data))
-
-            inserted_count = 0
-            for trade in trade_data:
-                trade_time = datetime.fromtimestamp(int(trade['T']) / 1000, tz=timezone.utc)
-                try:
-                    # Insert without conflict checks
-                    result = await Database.execute('''
-                        INSERT INTO market_data (time, price, volume)
-                        VALUES ($1, $2, $3)
-                    ''', trade_time, float(trade['p']), float(trade['v']))
-                    
-                    if result == "INSERT 0 1":
-                        inserted_count += 1
-                        logger.debug("Inserted new trade", time=trade_time.isoformat())
-                except Exception as e:
-                    logger.error("Failed to insert trade", error=str(e))
-
-            # Update progress bar after batch insert
-            if inserted_count > 0 and self.strategy and hasattr(self.strategy, 'progress_bar'):
-                count_result = await Database.fetch("SELECT COUNT(*) FROM market_data")
-                current_count = count_result[0]['count'] if count_result else 0
-                self.strategy.progress_bar.update(current_count)
-
-        except Exception as e:
-            logger.error("Trade processing failed", error=str(e))
-
-    async def run(self):
-        self.running = True
-        await self._connect_websocket()
-        # Start connection monitor
-        asyncio.create_task(self._connection_monitor())
-
-    async def _connection_monitor(self):
-        while self.running:
-            # Check for stale connection
-            if self.last_message_time and \
-               (datetime.now(timezone.utc) - self.last_message_time).total_seconds() > 60:
-                logger.warning("No messages received for 60 seconds, reconnecting...")
-                await self._reconnect()
-            await asyncio.sleep(10)
-
     async def stop(self):
+        """Clean shutdown procedure"""
         self.running = False
         if self.ws:
             await self.ws.close()
-        logger.info("WebSocket stopped")
+        logger.info("Market data service stopped")

@@ -13,17 +13,12 @@ services:
       - "5432:5432"
     networks:
       - trading-net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_bot"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   trader-app:
     build:
       context: .
       dockerfile: Dockerfile
-    env_file: .env  # Ensure this line is present
+    env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,11 +27,6 @@ services:
     volumes:
       - .:/app
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import asyncio; from app.debug.startup_check import StartupChecker; asyncio.run(StartupChecker.debug_check())"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
 volumes:
   timescaledb-data:

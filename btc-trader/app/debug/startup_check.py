@@ -1,3 +1,4 @@
+# app/debug/startup_check.py
 from datetime import datetime, timezone 
 from structlog import get_logger
 from app.core import Config, Database
@@ -37,10 +38,8 @@ class StartupChecker:
     async def _check_db_connection(cls):
         """Test database connectivity"""
         try:
-            await Database.get_pool()
-            version = await Database.fetch("SELECT version()")
-            logger.info("Database connection successful", 
-                       version=version[0]['version'])
+            await Database.fetchval("SELECT 1")
+            logger.info("Database connection successful")
         except Exception as e:
             raise ConnectionError(f"Database connection failed: {str(e)}")
 
@@ -53,15 +52,13 @@ class StartupChecker:
                 FROM information_schema.columns 
                 WHERE table_name = 'market_data'
             ''')
-            logger.info("Market_data table schema", 
-                       columns={c['column_name']: c['data_type'] for c in columns})
+            logger.info("Market_data table schema", columns=columns)
             
             hypertables = await Database.fetch('''
                 SELECT * FROM timescaledb_information.hypertables 
                 WHERE hypertable_name = 'market_data'
             ''')
-            logger.info("Hypertable status", 
-                       hypertable=dict(hypertables[0]) if hypertables else None)
+            logger.info("Hypertable status", hypertable=hypertables[0] if hypertables else None)
             
         except Exception as e:
             logger.error("Database schema check failed", error=str(e))
@@ -95,17 +92,4 @@ class StartupChecker:
             logger.info("Data flow check successful")
         except Exception as e:
             logger.error("Data flow check failed", error=str(e))
-            raise
-
-    @classmethod
-    async def debug_check(cls):
-        """Comprehensive debugging endpoint"""
-        logger.info("Starting debug checks...")
-        try:
-            await cls._check_db_connection()
-            await cls._check_db_schema()
-            await cls._check_data_flow()
-            logger.info("All debug checks passed")
-        except Exception as e:
-            logger.error("Debug checks failed", error=str(e))
             raise
