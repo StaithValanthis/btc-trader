@@ -33,3 +33,10 @@ class ProgressBar:
             sys.stderr.write('\r' + ' ' * (self.bar_length + 10) + '\r')
             sys.stderr.flush()
             self._printed = False
+
+# Add the progress_bar function for backward compatibility
+def progress_bar(percentage, bar_length=40):
+    """Static method for generating progress bar strings"""
+    filled_length = int(bar_length * percentage / 100)
+    bar = '█' * filled_length + '─' * (bar_length - filled_length)
+    return f"[{bar}] {percentage:.1f}%"

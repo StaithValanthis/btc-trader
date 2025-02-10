@@ -11,6 +11,7 @@ from app.services.trade_service import TradeService
 from app.ml.data_preprocessor import DataPreprocessor
 from app.ml.lstm_model import LSTMModel
 from app.core.config import Config
+from app.utils.progress import ProgressBar
 
 logger = get_logger(__name__)
 
@@ -22,6 +23,7 @@ class LSTMStrategy:
         self.model = self._initialize_model()
         self.model_loaded = False
         self.last_retrain = None
+        self.progress_bar = ProgressBar(total=100)
 
     def _initialize_model(self):
         """Initialize or load LSTM model"""

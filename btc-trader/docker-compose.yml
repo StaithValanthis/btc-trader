@@ -13,6 +13,12 @@ services:
       - "5432:5432"
     networks:
       - trading-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   trader-app:
     build:
