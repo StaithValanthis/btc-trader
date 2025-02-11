@@ -31,6 +31,7 @@ services:
     networks:
       - trading-net
     volumes:
+      - ./model_storage:/app/model_storage  # Directory instead of file
       - .:/app
     restart: unless-stopped
 
@@ -39,3 +40,4 @@ volumes:
 
 networks:
   trading-net:
+

@@ -33,6 +33,12 @@ ENV TF_CPP_MIN_LOG_LEVEL=3
 RUN useradd -m trader && \
     chown -R trader:trader /app
 
+RUN mkdir -p /app && \
+    chown -R trader:trader /app && \
+    chmod -R 755 /app
+    
+VOLUME /app/model_storage
+
 USER trader
 
 CMD ["python", "main.py"]
