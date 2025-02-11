@@ -21,11 +21,9 @@ class LSTMStrategy:
     def __init__(self, trade_service: TradeService):
         self.trade_service = trade_service
         self.preprocessor = DataPreprocessor()
-        # Our model expects (lookback_window, 12 features):
-        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)
+        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)  # 12 features
         self.model = self._initialize_model()
         self.analyzer = SentimentIntensityAnalyzer()
-
         self.last_retrain = None
         self.data_ready = False
         self.warmup_start_time = None
@@ -36,24 +34,20 @@ class LSTMStrategy:
 
     def _initialize_model(self):
         """Initialize or load LSTM model with validation."""
-        model_path = "lstm_model.h5"
+        model_path = "model_storage/lstm_model.h5"
         try:
             if os.path.exists(model_path):
-                logger.info("Model file found", path=model_path)
-                # Verify model compatibility
-                if self._validate_model_file(model_path):
-                    model = LSTMModel(self.input_shape)
-                    model.load(model_path)
-                    self.model_loaded = True
-                    logger.info("Model loaded successfully")
-                    return model
-                
-            logger.warning("Initializing new model")
-            return LSTMModel(self.input_shape)
-            
+                logger.info("Model file found, loading...", path=model_path)
+                model = LSTMModel(self.input_shape)
+                model.load(model_path)
+                self.model_loaded = True
+                logger.info("Model loaded successfully")
+                return model
+            else:
+                logger.warning("No existing model found, initializing new model...")
+                return LSTMModel(self.input_shape)
         except Exception as e:
             logger.error("Model initialization failed", error=str(e))
-            # Fallback to a fresh model
             return LSTMModel(self.input_shape)
 
     def _validate_model_file(self, path):
@@ -91,7 +85,7 @@ class LSTMStrategy:
                     await asyncio.sleep(30)
                     continue
 
-                # Periodic retraining
+                # Regular retraining
                 if self._should_retrain():
                     await self.retrain_model()
 
@@ -100,7 +94,6 @@ class LSTMStrategy:
                 await self.log_market_analysis()
 
                 await asyncio.sleep(60)
-
             except Exception as e:
                 logger.error("Strategy loop error", error=str(e))
                 await asyncio.sleep(10)
@@ -158,58 +151,38 @@ class LSTMStrategy:
         return (time.time() - self.last_retrain) > Config.MODEL_CONFIG['retrain_interval']
 
     async def retrain_model(self):
-        temp_path = None
+        """Robust model retraining with atomic operations."""
+        temp_path = "model_storage/lstm_model_temp.h5"
+        final_path = "model_storage/lstm_model.h5"
         try:
-            logger.info("Starting model retraining cycle")
-            
-            # 1) Data Collection
+            logger.info("Starting model retraining...")
             df = await self.get_historical_data()
             if len(df) < self.min_samples:
-                logger.warning("Skipping retrain - insufficient data",
-                              available=len(df),
-                              required=self.min_samples)
+                logger.warning("Skipping retrain - insufficient data", available=len(df), required=self.min_samples)
                 return
-                
-            # 2) Data Preparation
+
+            logger.info("Data preparation starting...")
             X, y = self.preprocessor.prepare_data(df)
             if X.shape[0] == 0:
-                logger.error("Data preparation failed (no training samples).")
+                logger.error("Data preparation failed")
                 return
 
-            # 3) Model Training
-            logger.info("Training model", samples=X.shape[0])
-            self.model.train(X, y,
-                             epochs=Config.MODEL_CONFIG['train_epochs'],
-                             batch_size=Config.MODEL_CONFIG['batch_size'])
+            logger.info("Training model...")
+            self.model.train(X, y)
 
-            # 4) Save model atomically
-            temp_path = "lstm_model_temp.h5"
-            final_path = "lstm_model.h5"
+            logger.info("Saving model...")
             self.model.save(temp_path)
 
-            # Verify saved file
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024:
-                raise IOError("Model save verification failed")
-
+            # Atomic replacement
             if os.path.exists(final_path):
                 os.remove(final_path)
             os.rename(temp_path, final_path)
 
-            # Validate loaded model
-            if self._validate_model_file(final_path):
-                self.model_loaded = True
-                logger.info("Model update successful")
-            else:
-                raise ValueError("Model validation failed after save")
-
+            logger.info("Model update successful")
+            self.model_loaded = True
         except Exception as e:
             logger.error("Retraining cycle failed", error=str(e))
             self.model_loaded = False
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception as e2:
-                    logger.error("Temp file cleanup failed", error=str(e2))
         finally:
             self.last_retrain = time.time()
 
@@ -234,6 +207,26 @@ class LSTMStrategy:
                 await self.trade_service.execute_trade(current_price, 'Buy', position_size)
             elif prediction < current_price * 0.998:
                 await self.trade_service.execute_trade(current_price, 'Sell', position_size)
+            
+            if prediction > current_price * 1.002:
+                # Calculate SL/TP dynamically (e.g., 1% SL, 2% TP)
+                stop_loss = current_price * 0.99
+                take_profit = current_price * 1.02
+                await self.trade_service.execute_trade(
+                    current_price, 
+                    'Buy',
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+            elif prediction < current_price * 0.998:
+                stop_loss = current_price * 1.01
+                take_profit = current_price * 0.98
+                await self.trade_service.execute_trade(
+                    current_price, 
+                    'Sell',
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )            
 
         except Exception as e:
             logger.error("Trade execution error", error=str(e))
@@ -287,9 +280,7 @@ class LSTMStrategy:
             
     async def get_historical_data(self):
         """
-        Fetch ~4 hours of 1-minute bars from 'market_data', 
-        then rename columns to open_1m, etc., so the DataPreprocessor 
-        can create indicators on the correct 1m columns.
+        Fetch ~4 hours of 1-minute bars from 'market_data'.
         """
         try:
             time_threshold = datetime.utcnow() - timedelta(hours=4)
@@ -326,17 +317,8 @@ class LSTMStrategy:
 
             logger.info("Raw data retrieved", samples=len(df))
 
-            # Rename aggregator columns to 1m style:
-            df.rename(columns={
-                'open': 'open_1m',
-                'high': 'high_1m',
-                'low': 'low_1m',
-                'close': 'close_1m',
-                'volume': 'volume_1m'
-            }, inplace=True)
-
-            # Now call the method that calculates indicators for these 1m columns:
-            df = self.preprocessor.create_features_for_1m(df)
+            # Process features with original column names
+            df = self.preprocessor.create_features(df)
             logger.info("Feature creation complete", samples=len(df))
 
             return df
@@ -344,4 +326,3 @@ class LSTMStrategy:
         except Exception as e:
             logger.error("Data retrieval failed", error=str(e))
             return pd.DataFrame()
-

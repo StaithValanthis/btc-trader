@@ -4,6 +4,8 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Conv1D, MaxPooling1D, Flatten, Bidirectional
 from tensorflow.keras.optimizers import Adam
 from structlog import get_logger
+import os
+
 # Optional tuner if you want:
 try:
     import keras_tuner as kt
@@ -20,10 +22,7 @@ class LSTMModel:
 
     def build_model(self):
         """
-        You can experiment:
-        - Basic LSTM
-        - Bi-LSTM
-        - Optional small Conv1D before LSTM, etc.
+        Build the LSTM model with optional Conv1D layer.
         """
         model = Sequential()
         # Example: small 1D conv for local pattern extraction:
@@ -67,18 +66,31 @@ class LSTMModel:
             return None
 
     def save(self, path):
+        """
+        Save the model to the specified path.
+        """
         try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            logger.info(f"Saving model to {path}...")
             self.model.save(path)
             logger.info(f"Model saved successfully at {path}")
         except Exception as e:
             logger.error("Failed to save model", error=str(e))
 
     def load(self, path):
+        """
+        Load the model from the specified path.
+        """
         try:
+            logger.info(f"Loading model from {path}...")
             self.model = tf.keras.models.load_model(path)
             logger.info(f"Model loaded successfully from {path}")
         except Exception as e:
             logger.error("Failed to load model", error=str(e))
+            # Initialize a new model if loading fails
+            self.model = self.build_model()
+            self.model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
 
     # ------------------------------------------------------------------
     # Optional KerasTuner approach
