@@ -16,3 +16,4 @@ build/
 .coverage
 htmlcov/
 .pytest_cache/
+lstm_model_temp.h5
