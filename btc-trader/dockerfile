@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies including TA-Lib prerequisites
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install TA-Lib
+# Install TA-Lib
 RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
     && tar -xvzf ta-lib-0.4.0-src.tar.gz \
     && cd ta-lib/ \
@@ -20,19 +20,21 @@ RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
     && cd .. \
     && rm -rf ta-lib-0.4.0-src.tar.gz ta-lib
 
-# Upgrade pip and install Python dependencies
+# Install Python dependencies
 RUN pip install --upgrade pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project code
 COPY . .
 
 ENV PYTHONPATH=/app
 ENV TF_CPP_MIN_LOG_LEVEL=3
 
-# Create non-root user for safety and adjust ownership
 RUN useradd -m trader && chown -R trader:trader /app
+RUN mkdir -p /app/model_storage && chown trader:trader /app/model_storage
+    
+VOLUME /app/model_storage
+
 USER trader
 
 CMD ["python", "main.py"]

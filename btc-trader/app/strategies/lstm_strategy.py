@@ -21,7 +21,7 @@ class LSTMStrategy:
     def __init__(self, trade_service: TradeService):
         self.trade_service = trade_service
         self.preprocessor = DataPreprocessor()
-        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)  # 12 features
+        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], len(self.preprocessor.required_columns))
         self.model = self._initialize_model()
         self.analyzer = SentimentIntensityAnalyzer()
         self.last_retrain = None
@@ -31,24 +31,36 @@ class LSTMStrategy:
         self.model_loaded = False
         self.min_samples = Config.MODEL_CONFIG['min_training_samples']
         self.progress_bar = ProgressBar(total=self.min_samples)
+        
+        # Ensure model storage directory exists
+        os.makedirs("model_storage", exist_ok=True)
 
     def _initialize_model(self):
-        """Initialize or load LSTM model with validation."""
+        """Initialize or load LSTM model. Create a baseline model if not present."""
         model_path = "model_storage/lstm_model.h5"
-        try:
-            if os.path.exists(model_path):
+        if os.path.exists(model_path):
+            try:
                 logger.info("Model file found, loading...", path=model_path)
                 model = LSTMModel(self.input_shape)
                 model.load(model_path)
                 self.model_loaded = True
                 logger.info("Model loaded successfully")
                 return model
-            else:
-                logger.warning("No existing model found, initializing new model...")
-                return LSTMModel(self.input_shape)
+            except Exception as e:
+                logger.error("Error loading model, initializing a new one", error=str(e))
+        else:
+            logger.warning("No existing model found, initializing a baseline model...")
+        
+        # Create and save a baseline model
+        model = LSTMModel(self.input_shape)
+        # Optionally, you can call model.save(model_path) here to create the file.
+        try:
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            model.save(model_path)
+            logger.info("Baseline model saved to disk")
         except Exception as e:
-            logger.error("Model initialization failed", error=str(e))
-            return LSTMModel(self.input_shape)
+            logger.error("Failed to save baseline model", error=str(e))
+        return model
 
     def _validate_model_file(self, path):
         """Check model file integrity and input shape compatibility."""
@@ -74,6 +86,39 @@ class LSTMStrategy:
         except Exception as e:
             logger.warning("Model validation failed", error=str(e))
             return False
+
+    async def retrain_model(self):
+        """Retrain the model once sufficient data is collected."""
+        temp_path = "model_storage/lstm_model_temp.h5"
+        final_path = "model_storage/lstm_model.h5"
+        try:
+            logger.info("Starting model retraining...")
+            # Get data and prepare it (implementation-specific)
+            df = await self.get_historical_data()
+            if len(df) < self.min_samples:
+                logger.warning("Skipping retrain - insufficient data", available=len(df), required=self.min_samples)
+                return
+
+            X, y = self.preprocessor.prepare_data(df)
+            if X.shape[0] == 0:
+                logger.error("Data preparation failed")
+                return
+
+            # Train the model on new data
+            self.model.train(X, y)
+            self.model.save(temp_path)
+
+            # Atomically replace the baseline model file
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            os.rename(temp_path, final_path)
+            logger.info("Model retraining successful; model updated")
+            self.model_loaded = True
+        except Exception as e:
+            logger.error("Retraining cycle failed", error=str(e))
+            self.model_loaded = False
+        finally:
+            self.last_retrain = time.time()
 
     async def run(self):
         """Main strategy loop."""

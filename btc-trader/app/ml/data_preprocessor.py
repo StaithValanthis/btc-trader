@@ -141,3 +141,44 @@ class DataPreprocessor:
         cum_vol_price = (close * volume).cumsum()
         vwap = cum_vol_price / cum_vol
         return vwap
+
+    def prepare_data(self, df):
+        """
+        Prepare the input sequences (X) and target values (y) for LSTM training.
+        
+        Args:
+            df (pd.DataFrame): DataFrame with features created by create_features.
+            
+        Returns:
+            tuple: (X, y) where X is a numpy array of input sequences and y is a numpy array of targets.
+        """
+        if df.empty:
+            logger.warning("Input DataFrame is empty in prepare_data")
+            return np.array([]), np.array([])
+        
+        # Check for required columns
+        missing_cols = set(self.required_columns) - set(df.columns)
+        if missing_cols:
+            logger.error("Missing required columns in prepare_data", missing=missing_cols)
+            return np.array([]), np.array([])
+        
+        # Extract features and fit scaler
+        features = df[self.required_columns]
+        scaled_features = self.scaler.fit_transform(features)
+        
+        # Determine the index of the 'close' price in the features
+        close_index = self.required_columns.index('close')
+        
+        X = []
+        y = []
+        
+        # Generate sequences
+        for i in range(len(scaled_features) - self.lookback - self.prediction_window + 1):
+            # Input sequence (lookback steps)
+            X_seq = scaled_features[i:i + self.lookback]
+            # Target (prediction_window steps ahead)
+            y_value = scaled_features[i + self.lookback + self.prediction_window - 1][close_index]
+            X.append(X_seq)
+            y.append(y_value)
+        
+        return np.array(X), np.array(y)
