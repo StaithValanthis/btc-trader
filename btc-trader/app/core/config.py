@@ -42,8 +42,8 @@ class Config:
         'min_training_samples': 100,  # Increased to account for feature creation
         'train_epochs': 20,
         'batch_size': 16,
-        'warmup_period': 1800,
-        'retrain_interval': 86400,
+        'warmup_period': 1,
+        'retrain_interval': 3600,
         'use_rolling_window': True,
         'rolling_window_hours': 1,
         'enable_hyperparam_tuning': False

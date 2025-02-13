@@ -186,45 +186,44 @@ class LSTMStrategy:
             self.model_loaded = True
             logger.info("Model retrained successfully",
                          training_samples=X.shape[0])
-
+    
         except Exception as e:
             logger.error("Retraining failed", error=str(e))
             if os.path.exists("model_storage/lstm_model.keras"):
                 self.model.load("model_storage/lstm_model.keras")
                 self.model_loaded = True
 
+        finally:
+                self.last_retrain = time.time()  # Update here to mark retrain time
+                
     async def get_prediction(self):
-        """Safe prediction with data validation."""
+        """Use the model to generate a next price prediction from aggregator data."""
         try:
             if not self.model_loaded:
                 return None
 
             df = await self.get_historical_data()
-            if len(df) < Config.MODEL_CONFIG['lookback_window']:
-                logger.warning("Insufficient data for prediction",
-                               available=len(df),
-                               required=Config.MODEL_CONFIG['lookback_window'])
+            if df.empty:
                 return None
 
+            # Use the new prepare_data method to get X and y.
             X, _ = self.preprocessor.prepare_data(df)
+            # Log the shape for debugging purposes
+            logger.info("Prediction input shape", shape=X.shape)
+
+            # Expecting X to have shape (n_samples, 60, 12). Take the last sample for prediction.
             if X.shape[0] == 0:
                 return None
 
-            # Use last sequence matching model's lookback window
-            sequence = X[-Config.MODEL_CONFIG['lookback_window']:]
-            if sequence.shape[0] != Config.MODEL_CONFIG['lookback_window']:
-                return None
-
-            pred = self.model.predict(np.array([sequence]))
-            logger.debug("Prediction generated", prediction=float(pred[0][0]))
+            pred = self.model.predict(X[-1:]).flatten()
             return pred
-
         except Exception as e:
-            logger.warning("Prediction attempt failed", error=str(e))
+            logger.error("Prediction failed", error=str(e))
             return None
 
+
     async def execute_trades(self):
-        """Execute trades with dynamic thresholds."""
+        """Execute trades with dynamic thresholds and SL/TP based on volatility."""
         try:
             prediction = await self.get_prediction()
             current_price = await self.trade_service.get_current_price()
@@ -232,29 +231,63 @@ class LSTMStrategy:
             if prediction is None or current_price is None:
                 return
 
-            # Calculate dynamic thresholds based on volatility
+            # Calculate dynamic thresholds based on volatility from historical close prices.
             df = await self.get_historical_data()
+            # Calculate volatility as the standard deviation of percent changes
             volatility = df['close'].pct_change().std()
+            
+            # Define dynamic thresholds (you may adjust the multiplier as needed)
             buy_threshold = 1 + (volatility * 1.5)
             sell_threshold = 1 - (volatility * 1.5)
 
+            # Determine stop loss and take profit levels.
+            # For a Buy trade:
+            #   SL is set below the current price by one volatility unit.
+            #   TP is set above the current price by two volatility units.
+            # For a Sell trade, the levels are reversed.
             if prediction > current_price * buy_threshold:
-                await self._execute_trade('Buy', current_price)
+                stop_loss = current_price * (1 - volatility)   # e.g. if volatility is 2%, SL is 98% of current price.
+                take_profit = current_price * (1 + volatility * 2) # e.g. TP is 104% if volatility is 2%
+                await self._execute_trade('Buy', current_price, stop_loss=stop_loss, take_profit=take_profit)
             elif prediction < current_price * sell_threshold:
-                await self._execute_trade('Sell', current_price)
+                stop_loss = current_price * (1 + volatility)   # For sell, a stop loss above current price.
+                take_profit = current_price * (1 - volatility * 2) # Take profit below current price.
+                await self._execute_trade('Sell', current_price, stop_loss=stop_loss, take_profit=take_profit)
 
         except Exception as e:
             logger.error("Trade execution failed", error=str(e))
 
-    async def _execute_trade(self, side: str, price: float):
-        """Validate position size before trading."""
+    async def _execute_trade(self, side: str, price: float, stop_loss: float = None, take_profit: float = None):
+        """
+        Validate the calculated position size before trading.
+        If the position size meets the minimum requirement, execute the trade
+        with optional stop loss (SL) and take profit (TP) levels.
+        
+        :param side: 'Buy' or 'Sell'
+        :param price: Current market price
+        :param stop_loss: Optional stop loss level
+        :param take_profit: Optional take profit level
+        """
         position_size = self._calculate_position_size(price)
-        if position_size >= Config.TRADING_CONFIG['min_qty']:
-            await self.trade_service.execute_trade(price, side, position_size)
+        if position_size >= self.trade_service.min_qty:
+            logger.info(
+                "Executing trade",
+                side=side,
+                price=price,
+                position_size=position_size,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            await self.trade_service.execute_trade(
+                price, side, position_size, stop_loss=stop_loss, take_profit=take_profit
+            )
         else:
-            logger.warning("Position size below minimum",
-                            calculated=position_size,
-                            required=Config.TRADING_CONFIG['min_qty'])
+            logger.warning(
+                "Position size below minimum",
+                calculated=position_size,
+                required=self.trade_service.min_qty
+            )
+
 
     def _calculate_position_size(self, current_price):
         """Risk-based position sizing."""
@@ -288,8 +321,12 @@ class LSTMStrategy:
 
     def _should_retrain(self):
         if not self.last_retrain:
+            logger.info("No previous retrain; should retrain now.")
             return True
-        return (time.time() - self.last_retrain) > Config.MODEL_CONFIG['retrain_interval']
+        elapsed = time.time() - self.last_retrain
+        logger.info("Time since last retrain", elapsed=elapsed, retrain_interval=Config.MODEL_CONFIG['retrain_interval'])
+        return elapsed > Config.MODEL_CONFIG['retrain_interval']
+
 
     async def log_market_analysis(self):
         """Periodic logging of sentiment & model predictions."""

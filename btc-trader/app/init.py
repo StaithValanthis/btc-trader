@@ -22,7 +22,9 @@ class TradingBot:
             await StartupChecker.run_checks()
             
             logger.info("Initializing database...")
+            await StartupChecker.run_checks()
             await Database.initialize()
+            await self.trade_service.initialize()
             
             self.running = True
             logger.info("Starting main components...")

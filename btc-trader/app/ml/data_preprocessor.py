@@ -182,3 +182,35 @@ class DataPreprocessor:
             y.append(y_value)
         
         return np.array(X), np.array(y)
+        
+    def prepare_data(self, df: pd.DataFrame):
+        """
+        Prepare training (or prediction) data using a sliding window.
+        Assumes that the DataFrame already contains the required features
+        in the following order (as defined by self.required_columns):
+          - base_columns: ['open', 'high', 'low', 'close', 'volume']
+          - indicator_columns: ['rsi', 'macd', 'signal', 'upper_band', 'lower_band', 'atr', 'vwap']
+        
+        The output X will have shape (n_samples, lookback_window, 12)
+        and y is taken as the 'close' value immediately after the window.
+        """
+        from app.core.config import Config  # ensure you have access to configuration
+        lookback = Config.MODEL_CONFIG['lookback_window']  # typically 60
+
+        # Ensure that df contains all required columns
+        missing = set(self.required_columns) - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+        # Reorder the DataFrame columns to match the required order
+        df = df[self.required_columns]
+        data = df.values  # shape: (num_rows, 12)
+
+        X, y = [], []
+        # Create sliding windows. We use the next 'close' value (column index 3) as the target.
+        for i in range(len(data) - lookback):
+            X.append(data[i:i + lookback])
+            y.append(data[i + lookback][3])
+        X = np.array(X)
+        y = np.array(y)
+        return X, y
