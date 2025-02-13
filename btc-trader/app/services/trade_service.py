@@ -60,16 +60,28 @@ class TradeService:
                         stop_loss=stop_loss,
                         take_profit=take_profit)
 
-            # Pass stop_loss and take_profit if supported by the API.
+            # Build the order parameters.
+            order_params = {
+                "category": "linear",
+                "symbol": Config.TRADING_CONFIG['symbol'],
+                "side": side,
+                "orderType": "Market",
+                "qty": str(qty),
+                "stopLoss": str(stop_loss) if stop_loss is not None else None,
+                "takeProfit": str(take_profit) if take_profit is not None else None,
+            }
+
+            # Only include positionIdx if your account is in hedge mode.
+            # Assume Config.TRADING_CONFIG contains a key "position_mode" with value either "one_way" or "hedge".
+            if Config.TRADING_CONFIG.get("position_mode", "one_way") == "hedge":
+                order_params["positionIdx"] = 0
+
+            # Remove any parameters that are None.
+            order_params = {k: v for k, v in order_params.items() if v is not None}
+
             response = await asyncio.to_thread(
                 self.session.place_order,
-                category="linear",
-                symbol=Config.TRADING_CONFIG['symbol'],
-                side=side,
-                orderType="Market",
-                qty=str(qty),
-                stopLoss=str(stop_loss) if stop_loss is not None else None,
-                takeProfit=str(take_profit) if take_profit is not None else None
+                **order_params
             )
 
             if response['retCode'] == 0:
@@ -89,7 +101,7 @@ class TradeService:
         For now, it simply logs the information.
         """
         logger.info("Logging trade", side=side, price=price)
-        # Example: Save trade details to the database if desired.
+        # For example, you might want to store the trade in the database:
         # await Database.execute('INSERT INTO trades (side, price, time) VALUES ($1, $2, $3)', side, price, datetime.utcnow())
 
     async def get_current_price(self):

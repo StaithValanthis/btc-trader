@@ -28,7 +28,7 @@ class Config:
     BYBIT_CONFIG = {
         'api_key': os.getenv('BYBIT_API_KEY', ''),
         'api_secret': os.getenv('BYBIT_API_SECRET', ''),
-        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
+        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'false'
     }
     
     TRADING_CONFIG = {
@@ -42,7 +42,7 @@ class Config:
         'min_training_samples': 100,  # Increased to account for feature creation
         'train_epochs': 20,
         'batch_size': 16,
-        'warmup_period': 1,
+        'warmup_period': 3600,
         'retrain_interval': 3600,
         'use_rolling_window': True,
         'rolling_window_hours': 1,
