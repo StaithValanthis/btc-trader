@@ -39,15 +39,15 @@ class Config:
  
     MODEL_CONFIG = {
         'lookback_window': 60,
-        'min_training_samples': 60,     # only need 15 bars to start
-        'train_epochs': 20,            # reduce epochs for quicker training
+        'min_training_samples': 100,  # Increased to account for feature creation
+        'train_epochs': 20,
         'batch_size': 16,
-        'warmup_period': 1800,          # 15 minutes = 900s
-        'retrain_interval': 86400,     # daily retraining
+        'warmup_period': 60,
+        'retrain_interval': 3600,
         'use_rolling_window': True,
-        'rolling_window_hours': 1,  # 15 minutes
+        'rolling_window_hours': 1,
         'enable_hyperparam_tuning': False
-    }    
+    }
     
     TIMESCALE_CONFIG = {
         'compression_interval': '7 days',
