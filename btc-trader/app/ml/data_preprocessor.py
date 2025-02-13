@@ -8,7 +8,7 @@ from structlog import get_logger
 logger = get_logger(__name__)
 
 class DataPreprocessor:
-    def __init__(self, lookback=60, prediction_window=5):
+    def __init__(self, lookback=60, prediction_window=30):
         self.lookback = lookback
         self.prediction_window = prediction_window
         self.scaler = MinMaxScaler(feature_range=(0, 1))

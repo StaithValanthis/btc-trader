@@ -1,3 +1,4 @@
+# app/core/database.py
 import asyncio
 import asyncpg
 from structlog import get_logger
@@ -13,13 +14,11 @@ class Database:
     @classmethod
     async def initialize(cls):
         """
-        Initialize database connection pool and create the market_data table 
-        with PRIMARY KEY(time, trade_id). Timescale requires 'time' in any 
-        unique/primary key on a hypertable.
+        Initialize database connection pool and create tables with TimescaleDB optimizations
         """
         for attempt in range(cls._max_retries):
             try:
-                logger.info(f"Attempting to create DB pool (attempt {attempt+1}/{cls._max_retries})...")
+                logger.info(f"Database connection attempt {attempt+1}/{cls._max_retries}")
                 cls._pool = await asyncpg.create_pool(
                     **Config.DB_CONFIG,
                     min_size=5,
@@ -29,10 +28,10 @@ class Database:
                 )
 
                 async with cls._pool.acquire() as conn:
-                    # 1) Create TimescaleDB extension
+                    # Create TimescaleDB extension
                     await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;')
 
-                    # 2) Create the market_data table with a primary key on (time, trade_id)
+                    # Market data table
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS market_data (
                             time TIMESTAMPTZ NOT NULL,
@@ -42,33 +41,101 @@ class Database:
                             PRIMARY KEY (time, trade_id)
                         );
                     ''')
-
-                    # 3) Convert it to a hypertable on 'time'
                     await conn.execute('''
                         SELECT create_hypertable(
-                            'market_data',
-                            'time',
-                            if_not_exists => TRUE
+                            'market_data', 
+                            'time', 
+                            if_not_exists => TRUE,
+                            chunk_time_interval => INTERVAL '1 hour'
                         );
                     ''')
 
-                logger.info("Database initialized")
+                    # Trades table
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS trades (
+                            time TIMESTAMPTZ NOT NULL,
+                            side TEXT NOT NULL,
+                            price DOUBLE PRECISION NOT NULL,
+                            quantity DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (time, side, price)
+                        );
+                    ''')
+                    await conn.execute('''
+                        SELECT create_hypertable(
+                            'trades',
+                            'time',
+                            if_not_exists => TRUE,
+                            chunk_time_interval => INTERVAL '1 day'
+                        );
+                    ''')
+
+                    # Configure compression
+                    await cls._configure_compression(conn)
+
+                logger.info("Database initialized successfully")
                 return
 
             except Exception as e:
-                # If creation fails, wait and retry
                 if attempt == cls._max_retries - 1:
-                    logger.error("Max DB connection attempts reached, giving up", error=str(e))
+                    logger.error("Database initialization failed", error=str(e))
                     raise
-                else:
-                    wait_time = cls._base_delay ** attempt
-                    logger.warning(
-                        f"Database connection failed (attempt {attempt+1}/{cls._max_retries}), "
-                        f"retrying in {wait_time} seconds...",
-                        error=str(e)
-                    )
-                    await asyncio.sleep(wait_time)
+                wait_time = cls._base_delay ** attempt
+                logger.warning("Retrying database connection", wait_seconds=wait_time)
+                await asyncio.sleep(wait_time)
 
+    @classmethod
+    async def _configure_compression(cls, conn):
+        """Configure TimescaleDB compression policies safely"""
+        try:
+            # Market data compression
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM timescaledb_information.compression_settings 
+                        WHERE hypertable_name = 'market_data'
+                    ) THEN
+                        ALTER TABLE market_data SET (
+                            timescaledb.compress,
+                            timescaledb.compress_orderby = 'time DESC',
+                            timescaledb.compress_segmentby = 'trade_id'
+                        );
+                    END IF;
+                    
+                    PERFORM add_compression_policy(
+                        'market_data', 
+                        INTERVAL '7 days',
+                        if_not_exists => true
+                    );
+                END $$;
+            ''')
+
+            # Trades compression
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM timescaledb_information.compression_settings 
+                        WHERE hypertable_name = 'trades'
+                    ) THEN
+                        ALTER TABLE trades SET (
+                            timescaledb.compress,
+                            timescaledb.compress_orderby = 'time DESC'
+                        );
+                    END IF;
+                    
+                    PERFORM add_compression_policy(
+                        'trades',
+                        INTERVAL '7 days',
+                        if_not_exists => true
+                    );
+                END $$;
+            ''')
+            logger.info("Compression configured safely")
+        except Exception as e:
+            logger.error("Compression configuration error", error=str(e))
+            raise
+        
     @classmethod
     async def close(cls):
         """Close the database connection pool"""
@@ -81,7 +148,7 @@ class Database:
     async def execute(cls, query, *args):
         """Execute a SQL command"""
         if not cls._pool:
-            raise RuntimeError("Database pool is not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.execute(query, *args)
 
@@ -89,7 +156,7 @@ class Database:
     async def fetch(cls, query, *args):
         """Fetch multiple rows"""
         if not cls._pool:
-            raise RuntimeError("Database pool is not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetch(query, *args)
 
@@ -97,7 +164,7 @@ class Database:
     async def fetchrow(cls, query, *args):
         """Fetch a single row"""
         if not cls._pool:
-            raise RuntimeError("Database pool is not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
@@ -105,6 +172,6 @@ class Database:
     async def fetchval(cls, query, *args):
         """Fetch a single value"""
         if not cls._pool:
-            raise RuntimeError("Database pool is not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetchval(query, *args)

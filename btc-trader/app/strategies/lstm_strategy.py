@@ -23,6 +23,8 @@ class LSTMStrategy:
         self.preprocessor = DataPreprocessor()
         self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)  # 12 features
         self.model = self._initialize_model()
+        self.current_position = None  # Track open positions: None/"long"/"short"
+        self.last_trade_time = None
         self.analyzer = SentimentIntensityAnalyzer()
         self.last_retrain = None
         self.data_ready = False
@@ -223,39 +225,52 @@ class LSTMStrategy:
 
 
     async def execute_trades(self):
-        """Execute trades with dynamic thresholds and SL/TP based on volatility."""
+        """Only execute trades if model is loaded and no existing position"""
         try:
+            if not self.model_loaded:
+                logger.warning("Skipping trades - model not loaded")
+                return
+
+            # Check if we already have an open position
+            if self.current_position is not None:
+                logger.info("Skipping trade - existing position", 
+                          position=self.current_position)
+                return
+
             prediction = await self.get_prediction()
             current_price = await self.trade_service.get_current_price()
-
+            
             if prediction is None or current_price is None:
                 return
 
-            # Calculate dynamic thresholds based on volatility from historical close prices.
-            df = await self.get_historical_data()
-            # Calculate volatility as the standard deviation of percent changes
-            volatility = df['close'].pct_change().std()
-            
-            # Define dynamic thresholds (you may adjust the multiplier as needed)
-            buy_threshold = 1 + (volatility * 1.5)
-            sell_threshold = 1 - (volatility * 1.5)
+            # Wider thresholds (3% stop-loss, 5% take-profit)
+            stop_loss = current_price * 1.03
+            take_profit = current_price * 0.95
 
-            # Determine stop loss and take profit levels.
-            # For a Buy trade:
-            #   SL is set below the current price by one volatility unit.
-            #   TP is set above the current price by two volatility units.
-            # For a Sell trade, the levels are reversed.
-            if prediction > current_price * buy_threshold:
-                stop_loss = current_price * (1 - volatility)   # e.g. if volatility is 2%, SL is 98% of current price.
-                take_profit = current_price * (1 + volatility * 2) # e.g. TP is 104% if volatility is 2%
-                await self._execute_trade('Buy', current_price, stop_loss=stop_loss, take_profit=take_profit)
-            elif prediction < current_price * sell_threshold:
-                stop_loss = current_price * (1 + volatility)   # For sell, a stop loss above current price.
-                take_profit = current_price * (1 - volatility * 2) # Take profit below current price.
-                await self._execute_trade('Sell', current_price, stop_loss=stop_loss, take_profit=take_profit)
+            if prediction > current_price * 1.02:  # 2% threshold
+                await self._execute_trade('Buy', current_price, stop_loss, take_profit)
+                self.current_position = "long"
+            elif prediction < current_price * 0.98:
+                await self._execute_trade('Sell', current_price, stop_loss, take_profit)
+                self.current_position = "short"
 
         except Exception as e:
-            logger.error("Trade execution failed", error=str(e))
+            logger.error("Trade execution error", error=str(e))
+
+    async def _execute_trade(self, side, price, sl, tp):
+        """Unified trade execution with position tracking"""
+        try:
+            await self.trade_service.execute_trade(
+                price=price,
+                side=side,
+                stop_loss=sl,
+                take_profit=tp
+            )
+            # Reset position if SL/TP hit
+            self.current_position = None
+        except Exception as e:
+            logger.error("Trade failed", error=str(e))
+            self.current_position = None
 
     async def _execute_trade(self, side: str, price: float, stop_loss: float = None, take_profit: float = None):
         """
