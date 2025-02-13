@@ -34,7 +34,7 @@ class LSTMStrategy:
 
     def _initialize_model(self):
         """Initialize or load LSTM model with validation."""
-        model_path = "model_storage/lstm_model.h5"
+        model_path = "model_storage/lstm_model.keras"
         try:
             if os.path.exists(model_path) and self._validate_model_file(model_path):
                 logger.info("Loading validated model", path=model_path)
@@ -182,15 +182,15 @@ class LSTMStrategy:
                 raise ValueError("Empty training data after preprocessing")
 
             self.model.train(X, y)
-            self.model.save("model_storage/lstm_model.h5")
+            self.model.save("model_storage/lstm_model.keras")
             self.model_loaded = True
             logger.info("Model retrained successfully",
                          training_samples=X.shape[0])
 
         except Exception as e:
             logger.error("Retraining failed", error=str(e))
-            if os.path.exists("model_storage/lstm_model.h5"):
-                self.model.load("model_storage/lstm_model.h5")
+            if os.path.exists("model_storage/lstm_model.keras"):
+                self.model.load("model_storage/lstm_model.keras")
                 self.model_loaded = True
 
     async def get_prediction(self):

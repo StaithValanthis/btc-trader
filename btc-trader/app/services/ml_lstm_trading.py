@@ -26,7 +26,7 @@ class MLTradeService:
     def load_model(self):
         """Load the trained LSTM model or train a new one."""
         try:
-            return tf.keras.models.load_model("lstm_model.h5")
+            return tf.keras.models.load_model("lstm_model.keras")
         except (OSError, FileNotFoundError):
             logger.warning("No existing LSTM model found, training a new one.")
             return self.train_model()
@@ -70,7 +70,7 @@ class MLTradeService:
         model.compile(optimizer='adam', loss='mean_squared_error')
         model.fit(X, y, epochs=10, batch_size=16)
         
-        model.save("lstm_model.h5")
+        model.save("lstm_model.keras")
         logger.info("LSTM model trained and saved.")
         return model
     
