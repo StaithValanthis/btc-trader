@@ -12,9 +12,19 @@ class ProgressBar:
         self._printed = False
 
     def update(self, progress):
-        """Update the progress bar"""
-        self.current = progress
-        self._render()
+        """Update the progress bar with proper terminal handling"""
+        try:
+            self.current = progress
+            filled_length = int(self.bar_length * self.current / self.total)
+            bar = '█' * filled_length + '─' * (self.bar_length - filled_length)
+            percentage = min(100, (self.current / self.total) * 100)
+            
+            # Write to stderr to avoid conflict with stdout logs
+            sys.stderr.write(f"\r[{bar}] {percentage:.1f}%")
+            sys.stderr.flush()
+            self._printed = True
+        except Exception as e:
+            logger.error("Progress bar update failed", error=str(e))
 
     def _render(self):
         """Render the progress bar in the terminal"""
@@ -27,12 +37,16 @@ class ProgressBar:
         sys.stderr.flush()
         self._printed = True
 
+
     def clear(self):
-        """Clear the progress bar from the terminal"""
-        if self._printed:
-            sys.stderr.write('\r' + ' ' * (self.bar_length + 10) + '\r')
-            sys.stderr.flush()
-            self._printed = False
+        """Clear the progress bar from terminal"""
+        try:
+            if self._printed:
+                sys.stderr.write('\r' + ' ' * (self.bar_length + 10) + '\r')
+                sys.stderr.flush()
+                self._printed = False
+        except Exception as e:
+            logger.error("Progress bar clear failed", error=str(e))
 
 # Add the progress_bar function for backward compatibility
 def progress_bar(percentage, bar_length=40):

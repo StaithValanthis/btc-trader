@@ -35,17 +35,19 @@ class Config:
         'symbol': os.getenv('SYMBOL', 'BTCUSDT'),
         'position_size': get_env_variable('POSITION_SIZE', 0.001),
         'max_leverage': get_env_variable('MAX_LEVERAGE', 10),
+        'position_mode': os.getenv('POSITION_MODE', 'MergedSingle'),
+        'auto_position_mode': os.getenv('AUTO_POSITION_MODE', 'true').lower() == 'true'
     }
  
     MODEL_CONFIG = {
         'lookback_window': 60,
-        'min_training_samples': 100,  # Increased to account for feature creation
+        'min_training_samples': 120,  # Increased from 100
         'train_epochs': 20,
         'batch_size': 16,
-        'warmup_period': 3600,
-        'retrain_interval': 3600,
+        'warmup_period': 7200,  # 2 hours
+        'retrain_interval': 86400,
         'use_rolling_window': True,
-        'rolling_window_hours': 1,
+        'rolling_window_hours': 2,  # Increased from 1
         'enable_hyperparam_tuning': False
     }
     

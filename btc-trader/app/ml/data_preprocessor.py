@@ -32,53 +32,39 @@ class DataPreprocessor:
         return df
 
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Given a DataFrame with base columns (open, high, low, close, volume),
-        calculate technical indicators and return a DataFrame with the new features.
-        
-        Indicators calculated:
-          - RSI (Relative Strength Index)
-          - MACD and its Signal line
-          - Bollinger Bands (upper and lower)
-          - ATR (Average True Range)
-          - VWAP (Volume Weighted Average Price)
-        
-        Raises a ValueError if any required base columns are missing.
-        """
+        """Create features with robust error handling"""
         try:
             if df.empty:
                 logger.warning("Input DataFrame is empty")
                 return df
 
-            # Check for required base columns
-            if not all(col in df.columns for col in self.base_columns):
-                raise ValueError(f"Missing required base columns: {set(self.base_columns) - set(df.columns)}")
+            # Ensure required columns exist
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_cols):
+                raise ValueError(f"Missing required columns: {set(required_cols) - set(df.columns)}")
 
-            # Ensure data is sorted by time (assumes index is datetime)
-            df = df.sort_index(ascending=True)
+            # Calculate indicators with error handling
+            try:
+                df['rsi'] = self._calculate_rsi(df['close'], period=14)
+                df['macd'], df['signal'] = self._calculate_macd(df['close'])
+                df['upper_band'], df['lower_band'] = self._calculate_bollinger_bands(df['close'])
+                df['atr'] = self._calculate_atr(df['high'], df['low'], df['close'])
+                df['vwap'] = self._calculate_vwap(df['close'], df['volume'])
+            except Exception as e:
+                logger.error("Indicator calculation failed", error=str(e))
+                return pd.DataFrame()
 
-            # Calculate RSI based on closing prices
-            df['rsi'] = self._calculate_rsi(df['close'], period=14)
+            # Forward fill missing values instead of dropping
+            df.ffill(inplace=True)
+            df.bfill(inplace=True)
 
-            # Calculate MACD and signal line
-            df['macd'], df['signal'] = self._calculate_macd(df['close'])
-
-            # Calculate Bollinger Bands
-            df['upper_band'], df['lower_band'] = self._calculate_bollinger_bands(df['close'], window=20, num_std=2)
-
-            # Calculate ATR (Average True Range)
-            df['atr'] = self._calculate_atr(df['high'], df['low'], df['close'], period=14)
-
-            # Calculate VWAP (Volume Weighted Average Price)
-            df['vwap'] = self._calculate_vwap(df['close'], df['volume'])
-
-            # Verify that all indicator columns are present; if not, raise an error.
+            # Verify all required columns are present
             missing = set(self.required_columns) - set(df.columns)
             if missing:
-                raise ValueError(f"Missing calculated columns: {missing}")
+                logger.error("Missing calculated columns", columns=missing)
+                return pd.DataFrame()
 
-            # Return the dataframe with rows that have no missing values
-            return df.dropna()
+            return df
 
         except Exception as e:
             logger.error("Feature creation failed", error=str(e))

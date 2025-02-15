@@ -75,37 +75,42 @@ class LSTMStrategy:
             return False
 
     async def _check_data_availability(self):
-        """Check data readiness by ensuring enough aggregated bars."""
+        """Check data readiness with proper progress bar updates"""
         if not self.data_ready:
             if not self.warmup_start_time:
                 self.warmup_start_time = time.time()
                 logger.info("Warmup phase started")
+                # Progress bar already initialized in __init__
 
-            count_result = await Database.fetch(
-                "SELECT COUNT(DISTINCT time_bucket('1 minute', time)) as count FROM market_data"
-            )
-            final_count = count_result[0]['count'] if count_result else 0
+            # Fetch data count
+            time_threshold = datetime.utcnow() - timedelta(hours=6)
+            count_result = await Database.fetchval('''
+                SELECT COUNT(DISTINCT time_bucket('1 minute', time)) 
+                FROM market_data 
+                WHERE time > $1
+            ''', time_threshold)
+            final_count = count_result if count_result else 0
 
+            # Update progress bar
             self.progress_bar.update(final_count)
 
-            data_progress = final_count / self.min_samples
+            # Calculate progress metrics
+            data_progress = final_count / self.progress_bar.total
             elapsed = time.time() - self.warmup_start_time
             time_progress = elapsed / Config.MODEL_CONFIG['warmup_period']
 
-            overall_progress = min(data_progress, time_progress) * 100
-
             logger.info(
                 "Warmup Progress",
-                aggregator_rows=final_count,
-                required_rows=self.min_samples,
+                aggregated_bars=final_count,
+                required_bars=self.progress_bar.total,
                 data_progress=f"{data_progress*100:.1f}%",
                 time_elapsed=int(elapsed),
                 time_required=Config.MODEL_CONFIG['warmup_period'],
-                time_progress=f"{time_progress*100:.1f}%",
-                overall_progress=f"{overall_progress:.1f}%"
+                time_progress=f"{time_progress*100:.1f}%"
             )
 
-            if final_count >= self.min_samples and elapsed >= Config.MODEL_CONFIG['warmup_period']:
+            if final_count >= self.progress_bar.total and \
+            elapsed >= Config.MODEL_CONFIG['warmup_period']:
                 self.data_ready = True
                 self.progress_bar.clear()
                 logger.info("Warmup complete - Starting trading")
@@ -225,66 +230,75 @@ class LSTMStrategy:
 
 
     async def execute_trades(self):
-        """Only execute trades if model is loaded and no existing position"""
+        """Execute trades based on model predictions and risk parameters"""
         try:
             if not self.model_loaded:
                 logger.warning("Skipping trades - model not loaded")
                 return
 
-            # Check if we already have an open position
+            # Check for existing position
             if self.current_position is not None:
                 logger.info("Skipping trade - existing position", 
-                          position=self.current_position)
+                            position=self.current_position)
                 return
 
+            # Get prediction and current price
             prediction = await self.get_prediction()
             current_price = await self.trade_service.get_current_price()
             
             if prediction is None or current_price is None:
                 return
 
-            # Wider thresholds (3% stop-loss, 5% take-profit)
-            stop_loss = current_price * 1.03
-            take_profit = current_price * 0.95
-
-            if prediction > current_price * 1.02:  # 2% threshold
-                await self._execute_trade('Buy', current_price, stop_loss, take_profit)
+            # Calculate risk parameters based on direction
+            if prediction > current_price * 1.02:  # Long signal
+                stop_loss = current_price * 0.97   # 3% below entry
+                take_profit = current_price * 1.05  # 5% above entry
+                await self._execute_trade(
+                    side='Buy',
+                    price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
                 self.current_position = "long"
-            elif prediction < current_price * 0.98:
-                await self._execute_trade('Sell', current_price, stop_loss, take_profit)
+
+            elif prediction < current_price * 0.98:  # Short signal
+                stop_loss = current_price * 1.03    # 3% above entry
+                take_profit = current_price * 0.95  # 5% below entry
+                await self._execute_trade(
+                    side='Sell',
+                    price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
                 self.current_position = "short"
 
         except Exception as e:
             logger.error("Trade execution error", error=str(e))
 
-    async def _execute_trade(self, side, price, sl, tp):
-        """Unified trade execution with position tracking"""
-        try:
-            await self.trade_service.execute_trade(
-                price=price,
-                side=side,
-                stop_loss=sl,
-                take_profit=tp
-            )
-            # Reset position if SL/TP hit
-            self.current_position = None
-        except Exception as e:
-            logger.error("Trade failed", error=str(e))
-            self.current_position = None
 
     async def _execute_trade(self, side: str, price: float, stop_loss: float = None, take_profit: float = None):
         """
-        Validate the calculated position size before trading.
-        If the position size meets the minimum requirement, execute the trade
-        with optional stop loss (SL) and take profit (TP) levels.
+        Execute trade with proper risk management and position tracking.
         
-        :param side: 'Buy' or 'Sell'
-        :param price: Current market price
-        :param stop_loss: Optional stop loss level
-        :param take_profit: Optional take profit level
+        Args:
+            side: 'Buy' or 'Sell'
+            price: Current market price
+            stop_loss: Stop loss level (absolute price)
+            take_profit: Take profit level (absolute price)
         """
-        position_size = self._calculate_position_size(price)
-        if position_size >= self.trade_service.min_qty:
+        try:
+            # Calculate position size based on risk management
+            position_size = self._calculate_position_size(price)
+            
+            # Validate minimum order quantity
+            if position_size < self.trade_service.min_qty:
+                logger.warning(
+                    "Position size below minimum",
+                    calculated=position_size,
+                    required=self.trade_service.min_qty
+                )
+                return
+
             logger.info(
                 "Executing trade",
                 side=side,
@@ -293,15 +307,24 @@ class LSTMStrategy:
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )
+
+            # Execute trade through trade service
             await self.trade_service.execute_trade(
-                price, side, position_size, stop_loss=stop_loss, take_profit=take_profit
+                side=side,
+                price=price,
+                position_size=position_size,
+                stop_loss=stop_loss,
+                take_profit=take_profit
             )
-        else:
-            logger.warning(
-                "Position size below minimum",
-                calculated=position_size,
-                required=self.trade_service.min_qty
-            )
+
+            # Update position tracking
+            self.current_position = side.lower()
+            self.last_trade_time = time.time()
+
+        except Exception as e:
+            logger.error("Trade execution failed", error=str(e))
+            self.current_position = None
+            raise
 
 
     def _calculate_position_size(self, current_price):

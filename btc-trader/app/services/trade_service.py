@@ -1,4 +1,3 @@
-# app/services/trade_service.py
 import asyncio
 from pybit.unified_trading import HTTP
 from structlog import get_logger
@@ -13,117 +12,76 @@ class TradeService:
         self.position_size = Config.TRADING_CONFIG['position_size']
         self.min_qty = None
         self.running = False
-        self.current_position = None  # Track open positions
+        self.current_position = None
 
     async def initialize(self):
-        """Initialize with better error handling"""
+        """Initialize exchange connection with proper error handling"""
         try:
             self.session = HTTP(
                 testnet=Config.BYBIT_CONFIG['testnet'],
                 api_key=Config.BYBIT_CONFIG['api_key'],
-                api_secret=Config.BYBIT_CONFIG['api_secret']
+                api_secret=Config.BYBIT_CONFIG['api_secret'],
+                recv_window=5000                
             )
-            
-            # Validate position mode first
-            await self._validate_position_mode()
-            
-            # Then check minimum quantity
+            if Config.TRADING_CONFIG['auto_position_mode']:
+                await self._validate_position_mode()
             await self._get_min_order_qty()
-            
-            logger.info("Trade service initialized")
+            logger.info("Trade service initialized successfully")
         except Exception as e:
-            logger.error("Trade service initialization failed", error=str(e))
-            await self.stop()
+            logger.critical("Fatal error initializing trade service", error=str(e))
             raise
 
-    # app/services/trade_service.py
     async def _validate_position_mode(self):
-        """Safely enforce one-way position mode with comprehensive checks"""
-        try:
-            # 1. Check current position mode
-            mode_info = await asyncio.to_thread(
-                self.session.get_position_mode,
-                category="linear"
-            )
-            current_mode = mode_info['result']['mode']
-            
-            if current_mode == 0:
-                logger.info("Already in one-way position mode")
-                return
+        """Modern position mode validation for Bybit v5 API"""
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                # Get current position mode
+                current_mode = await asyncio.to_thread(
+                    self.session.get_positions,
+                    category="linear",
+                    symbol=Config.TRADING_CONFIG['symbol']
+                )
+                
+                # Parse response for position mode
+                if current_mode.get('retCode') != 0:
+                    logger.error("Failed to get positions", response=current_mode)
+                    continue
 
-            # 2. Close all positions
-            await self._close_all_positions()
+                position_mode = current_mode['result']['list'][0].get('positionMode', 'MergedSingle')
+                logger.debug("Current position mode", mode=position_mode)
 
-            # 3. Cancel all orders
-            await self._cancel_all_orders()
+                if position_mode == "MergedSingle":
+                    logger.info("Already in one-way position mode")
+                    return
 
-            # 4. Switch to one-way mode
-            logger.info("Switching to one-way position mode")
-            response = await asyncio.to_thread(
-                self.session.switch_position_mode,
-                category="linear",
-                symbol=Config.TRADING_CONFIG['symbol'],
-                mode=0
-            )
-
-            if response['retCode'] != 0:
-                logger.warning("Position mode change response", response=response)
-
-        except Exception as e:
-            if '110025' in str(e):
-                logger.info("Position mode already set to one-way")
-            else:
-                logger.error("Position mode validation failed", error=str(e))
-                raise
-
-    async def _close_all_positions(self):
-        """Close all positions with market orders"""
-        try:
-            positions = await asyncio.to_thread(
-                self.session.get_positions,
-                category="linear",
-                symbol=Config.TRADING_CONFIG['symbol']
-            )
-            
-            for pos in positions['result']['list']:
-                if float(pos['size']) > 0:
-                    side = "Sell" if pos['side'] == "Buy" else "Buy"
-                    await asyncio.to_thread(
-                        self.session.place_order,
-                        category="linear",
-                        symbol=Config.TRADING_CONFIG['symbol'],
-                        side=side,
-                        orderType="Market",
-                        qty=pos['size'],
-                        reduceOnly=True
-                    )
-                    logger.info("Closed position", position=pos)
-
-        except Exception as e:
-            logger.error("Position closure failed", error=str(e))
-            raise
-
-    async def _cancel_all_orders(self):
-        """Cancel all open orders"""
-        try:
-            orders = await asyncio.to_thread(
-                self.session.get_open_orders,
-                category="linear",
-                symbol=Config.TRADING_CONFIG['symbol']
-            )
-            
-            for order in orders['result']['list']:
-                await asyncio.to_thread(
-                    self.session.cancel_order,
+                # Switch to one-way mode
+                logger.info("Switching position mode")
+                switch_response = await asyncio.to_thread(
+                    self.session.set_position_mode,
                     category="linear",
                     symbol=Config.TRADING_CONFIG['symbol'],
-                    orderId=order['orderId']
+                    mode=3  # 3 = One-Way Mode in Bybit v5
                 )
-                logger.info("Cancelled order", order=order)
-                
-        except Exception as e:
-            logger.error("Order cancellation failed", error=str(e))
-            raise
+
+                if switch_response.get('retCode') == 0:
+                    logger.info("Successfully switched to one-way mode")
+                    return
+                    
+                if switch_response.get('retCode') == 110025:
+                    logger.info("Position mode already set")
+                    return
+
+            except Exception as e:
+                if "110025" in str(e):
+                    logger.info("Position mode already set (verified via exception)")
+                    return
+                logger.error(f"Position validation error (attempt {attempt+1}/{max_retries})", 
+                            error=str(e))
+                await asyncio.sleep(1)
+        
+        logger.error("Failed to validate position mode after multiple attempts")
+        raise ConnectionError("Could not validate position mode")
 
     async def _get_min_order_qty(self):
         """Fetch minimum order quantity"""
@@ -138,9 +96,7 @@ class TradeService:
     async def execute_trade(self, price: float, side: str, 
                           stop_loss: float = None, 
                           take_profit: float = None):
-        """
-        Execute a market order with risk management parameters
-        """
+        """Execute a market order with risk management"""
         try:
             if self.position_size < self.min_qty:
                 logger.error("Position size below minimum", 
@@ -148,20 +104,13 @@ class TradeService:
                             actual=self.position_size)
                 return
 
-            logger.info("Placing trade",
-                        side=side,
-                        price=price,
-                        size=self.position_size,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit)
-
             order_params = {
                 "category": "linear",
                 "symbol": Config.TRADING_CONFIG['symbol'],
                 "side": side,
                 "orderType": "Market",
                 "qty": str(self.position_size),
-                "position_idx": 0,  # Explicit one-way mode
+                "positionIdx": 0,  # Mandatory for one-way mode
                 "stopLoss": str(stop_loss) if stop_loss else None,
                 "takeProfit": str(take_profit) if take_profit else None
             }
@@ -181,9 +130,7 @@ class TradeService:
                 self.current_position = side.lower()
             else:
                 error_msg = response.get('retMsg', 'Unknown error')
-                logger.error("Trade failed", 
-                            error=error_msg,
-                            response=response)
+                logger.error("Trade failed", error=error_msg)
 
         except Exception as e:
             logger.error("Trade execution error", error=str(e))
@@ -198,7 +145,6 @@ class TradeService:
                 (time, side, price, quantity)
                 VALUES ($1, $2, $3, $4)
             ''', datetime.now(timezone.utc), side, price, qty)
-            logger.info("Trade logged to database")
         except Exception as e:
             logger.error("Failed to log trade", error=str(e))
 
@@ -215,15 +161,13 @@ class TradeService:
             return None
 
     async def stop(self):
-        """Clean up resources and close position"""
+        """Clean up resources and close positions"""
         if self.current_position:
             logger.info("Closing open position", position=self.current_position)
             try:
                 await self.execute_trade(
                     price=await self.get_current_price(),
-                    side="Buy" if self.current_position == "sell" else "Sell",
-                    stop_loss=None,
-                    take_profit=None
+                    side="Buy" if self.current_position == "sell" else "Sell"
                 )
             except Exception as e:
                 logger.error("Position close failed", error=str(e))
@@ -232,19 +176,3 @@ class TradeService:
             await asyncio.to_thread(self.session.close)
             
         logger.info("Trade service stopped")
-
-    # app/services/trade_service.py
-    async def _validate_position_mode(self):
-        """Validate and enforce one-way position mode"""
-        try:
-            # Switch directly to one-way mode
-            logger.info("Enforcing one-way position mode")
-            await asyncio.to_thread(
-                self.session.switch_position_mode,
-                category="linear",
-                symbol=Config.TRADING_CONFIG['symbol'],
-                mode=0  # 0 = One-Way Mode
-            )
-        except Exception as e:
-            logger.error("Position mode enforcement failed", error=str(e))
-            raise
