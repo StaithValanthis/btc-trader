@@ -212,7 +212,7 @@ class LSTMStrategy:
                 return None
 
             # Use the new prepare_data method to get X and y.
-            X, _ = self.preprocessor.prepare_data(df)
+            X, _ = self.preprocessor.prepare_training_data (df)
             # Log the shape for debugging purposes
             logger.info("Prediction input shape", shape=X.shape)
 

@@ -128,7 +128,7 @@ class DataPreprocessor:
         vwap = cum_vol_price / cum_vol
         return vwap
 
-    def prepare_data(self, df):
+    def prepare_training_data (self, df):
         """
         Prepare the input sequences (X) and target values (y) for LSTM training.
         
@@ -169,7 +169,7 @@ class DataPreprocessor:
         
         return np.array(X), np.array(y)
         
-    def prepare_data(self, df: pd.DataFrame):
+    def prepare_prediction_data(self, df: pd.DataFrame):
         """
         Prepare training (or prediction) data using a sliding window.
         Assumes that the DataFrame already contains the required features
