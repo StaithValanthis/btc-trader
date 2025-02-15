@@ -1,0 +1,11 @@
+aiohttp
+asyncpg
+tortoise-orm
+scikit-learn
+pandas
+joblib
+python-dotenv
+tenacity
+tensorflow
+flask
+hyperopt

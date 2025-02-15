@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  timescale:
+    image: timescale/timescaledb:latest-pg15
+    container_name: timescale_db
+    environment:
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=trading_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+
+  model_service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: model_service
+    command: ["python", "model_service.py"]
+    depends_on:
+      - timescale
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=trading_data
+      - POSTGRES_HOST=timescale_db
+      - POSTGRES_PORT=5432
+    restart: always
+    ports:
+      - "5000:5000"
+
+  trading_bot:
+    build: .
+    container_name: trading_bot
+    depends_on:
+      - timescale
+      - model_service
+    environment:
+      - BYBIT_API_KEY=your_api_key
+      - BYBIT_API_SECRET=your_api_secret
+      - BYBIT_BASE_URL=https://api.bybit.com
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=trading_data
+      - POSTGRES_HOST=timescale_db
+      - POSTGRES_PORT=5432
+      - CAPITAL=10000
+    restart: always
+
+volumes:
+  timescale_data:
