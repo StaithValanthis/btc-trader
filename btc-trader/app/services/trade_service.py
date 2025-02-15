@@ -93,23 +93,43 @@ class TradeService:
             )
             self.min_qty = float(info['result']['list'][0]['lotSizeFilter']['minOrderQty'])
 
-    async def execute_trade(self, price: float, side: str, 
-                          stop_loss: float = None, 
-                          take_profit: float = None):
-        """Execute a market order with risk management"""
+    async def execute_trade(self, 
+                        side: str,
+                        price: float,
+                        stop_loss: float = None,
+                        take_profit: float = None):
+        """
+        Execute a market order with risk management.
+        
+        Args:
+            side: 'Buy' or 'Sell'
+            price: Current market price
+            stop_loss: Stop loss price level
+            take_profit: Take profit price level
+        """
         try:
-            if self.position_size < self.min_qty:
+            # Use instance position_size
+            position_size = self.position_size
+            
+            if position_size < self.min_qty:
                 logger.error("Position size below minimum", 
                             required=self.min_qty,
-                            actual=self.position_size)
+                            actual=position_size)
                 return
+
+            logger.info("Placing trade",
+                        side=side,
+                        price=price,
+                        size=position_size,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit)
 
             order_params = {
                 "category": "linear",
                 "symbol": Config.TRADING_CONFIG['symbol'],
                 "side": side,
                 "orderType": "Market",
-                "qty": str(self.position_size),
+                "qty": str(position_size),
                 "positionIdx": 0,  # Mandatory for one-way mode
                 "stopLoss": str(stop_loss) if stop_loss else None,
                 "takeProfit": str(take_profit) if take_profit else None
@@ -124,7 +144,7 @@ class TradeService:
             )
 
             if response['retCode'] == 0:
-                await self._log_trade(side, price, self.position_size)
+                await self._log_trade(side, price, position_size)
                 logger.info("Trade executed successfully",
                             order_id=response['result']['orderId'])
                 self.current_position = side.lower()

@@ -74,49 +74,47 @@ class LSTMStrategy:
             logger.warning("Model validation failed", error=str(e))
             return False
 
+    # app/strategies/lstm_strategy.py
     async def _check_data_availability(self):
-        """Check data readiness with proper progress bar updates"""
+        """Check data readiness with fixed time window"""
         if not self.data_ready:
             if not self.warmup_start_time:
+                # Initialize warmup parameters
                 self.warmup_start_time = time.time()
+                self.warmup_data_start = datetime.utcnow()  # Fixed start point
                 logger.info("Warmup phase started")
-                # Progress bar already initialized in __init__
+                self.progress_bar = ProgressBar(total=self.min_samples)
 
-            # Fetch data count
-            time_threshold = datetime.utcnow() - timedelta(hours=6)
-            count_result = await Database.fetchval('''
+            # Always use initial warmup start time for queries
+            records = await Database.fetchval('''
                 SELECT COUNT(DISTINCT time_bucket('1 minute', time)) 
                 FROM market_data 
                 WHERE time > $1
-            ''', time_threshold)
-            final_count = count_result if count_result else 0
+            ''', self.warmup_data_start)
 
-            # Update progress bar
-            self.progress_bar.update(final_count)
+            current_count = records or 0
+            elapsed_time = time.time() - self.warmup_start_time
 
-            # Calculate progress metrics
-            data_progress = final_count / self.progress_bar.total
-            elapsed = time.time() - self.warmup_start_time
-            time_progress = elapsed / Config.MODEL_CONFIG['warmup_period']
+            # Update progress
+            self.progress_bar.update(current_count)
 
-            logger.info(
-                "Warmup Progress",
-                aggregated_bars=final_count,
-                required_bars=self.progress_bar.total,
-                data_progress=f"{data_progress*100:.1f}%",
-                time_elapsed=int(elapsed),
-                time_required=Config.MODEL_CONFIG['warmup_period'],
-                time_progress=f"{time_progress*100:.1f}%"
-            )
-
-            if final_count >= self.progress_bar.total and \
-            elapsed >= Config.MODEL_CONFIG['warmup_period']:
+            # Completion check
+            if current_count >= self.min_samples or elapsed_time >= Config.MODEL_CONFIG['warmup_period']:
                 self.data_ready = True
-                self.progress_bar.clear()
-                logger.info("Warmup complete - Starting trading")
+                self.progress_bar.update(self.min_samples)  # Force 100%
+                logger.info("Warmup requirements met", 
+                        samples=current_count,
+                        duration=elapsed_time)
                 return True
 
+            # Log current state
+            logger.info("Warmup status",
+                    samples=current_count,
+                    required=self.min_samples,
+                    elapsed=f"{elapsed_time:.1f}s",
+                    remaining=f"{Config.MODEL_CONFIG['warmup_period']-elapsed_time:.1f}s")
             return False
+        
         return True
 
     async def get_historical_data(self):
@@ -228,7 +226,6 @@ class LSTMStrategy:
             logger.error("Prediction failed", error=str(e))
             return None
 
-
     async def execute_trades(self):
         """Execute trades based on model predictions and risk parameters"""
         try:
@@ -287,14 +284,11 @@ class LSTMStrategy:
             take_profit: Take profit level (absolute price)
         """
         try:
-            # Calculate position size based on risk management
-            position_size = self._calculate_position_size(price)
-            
             # Validate minimum order quantity
-            if position_size < self.trade_service.min_qty:
+            if self.trade_service.position_size < self.trade_service.min_qty:
                 logger.warning(
                     "Position size below minimum",
-                    calculated=position_size,
+                    calculated=self.trade_service.position_size,
                     required=self.trade_service.min_qty
                 )
                 return
@@ -303,7 +297,7 @@ class LSTMStrategy:
                 "Executing trade",
                 side=side,
                 price=price,
-                position_size=position_size,
+                position_size=self.trade_service.position_size,
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )
@@ -312,7 +306,6 @@ class LSTMStrategy:
             await self.trade_service.execute_trade(
                 side=side,
                 price=price,
-                position_size=position_size,
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )

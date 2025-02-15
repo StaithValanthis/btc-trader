@@ -28,7 +28,7 @@ class Config:
     BYBIT_CONFIG = {
         'api_key': os.getenv('BYBIT_API_KEY', ''),
         'api_secret': os.getenv('BYBIT_API_SECRET', ''),
-        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'false'
+        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
     }
     
     TRADING_CONFIG = {
@@ -40,16 +40,16 @@ class Config:
     }
  
     MODEL_CONFIG = {
-        'lookback_window': 60,
-        'min_training_samples': 120,  # Increased from 100
+        'lookback_window': 30,
+        'min_training_samples': 60, 
         'train_epochs': 20,
         'batch_size': 16,
-        'warmup_period': 7200,  # 2 hours
+        'warmup_period': 3600,
         'retrain_interval': 86400,
         'use_rolling_window': True,
-        'rolling_window_hours': 2,  # Increased from 1
+        'rolling_window_hours': 1,
         'enable_hyperparam_tuning': False
-    }
+    }  
     
     TIMESCALE_CONFIG = {
         'compression_interval': '7 days',
