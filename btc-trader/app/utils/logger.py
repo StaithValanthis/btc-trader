@@ -1,4 +1,3 @@
-# app/utils/logger.py
 import structlog
 import logging
 import os
@@ -20,13 +19,11 @@ def configure_logger():
         cache_logger_on_first_use=True,
     )
 
-    # Configure standard logging
     logging.basicConfig(
         format="%(message)s",
         level=log_level,
         handlers=[logging.StreamHandler()]
     )
 
-# Initialize the logger
 configure_logger()
 logger = structlog.get_logger()

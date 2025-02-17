@@ -28,26 +28,28 @@ class Config:
     BYBIT_CONFIG = {
         'api_key': os.getenv('BYBIT_API_KEY', ''),
         'api_secret': os.getenv('BYBIT_API_SECRET', ''),
-        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'false'
+        'testnet': os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
     }
     
     TRADING_CONFIG = {
         'symbol': os.getenv('SYMBOL', 'BTCUSDT'),
         'position_size': get_env_variable('POSITION_SIZE', 0.001),
         'max_leverage': get_env_variable('MAX_LEVERAGE', 10),
+        'position_mode': os.getenv('POSITION_MODE', 'MergedSingle'),
+        'auto_position_mode': os.getenv('AUTO_POSITION_MODE', 'true').lower() == 'true'
     }
  
     MODEL_CONFIG = {
-        'lookback_window': 60,
-        'min_training_samples': 100,  # Increased to account for feature creation
+        'lookback_window': 30,
+        'min_training_samples': 60, 
         'train_epochs': 20,
         'batch_size': 16,
         'warmup_period': 3600,
-        'retrain_interval': 3600,
+        'retrain_interval': 86400,
         'use_rolling_window': True,
         'rolling_window_hours': 1,
         'enable_hyperparam_tuning': False
-    }
+    }  
     
     TIMESCALE_CONFIG = {
         'compression_interval': '7 days',

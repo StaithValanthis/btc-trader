@@ -1,40 +1,43 @@
-FROM python:3.11-slim
-
-WORKDIR /app
-
-# Install system dependencies
+# Stage 1: Build TA-Lib
+FROM python:3.11-slim AS talib-builder
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
-    python3-dev \
-    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Install TA-Lib
 RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
     && tar -xvzf ta-lib-0.4.0-src.tar.gz \
     && cd ta-lib/ \
     && ./configure --prefix=/usr \
     && make \
-    && make install \
-    && cd .. \
-    && rm -rf ta-lib-0.4.0-src.tar.gz ta-lib
+    && make install
+
+# Stage 2: Final Image
+FROM python:3.11-slim
+WORKDIR /app
+
+# Copy TA-Lib artifacts from the builder stage
+COPY --from=talib-builder /usr/lib/libta_lib.* /usr/lib/
+COPY --from=talib-builder /usr/include/ta-lib/ /usr/include/ta-lib/
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-RUN pip install --upgrade pip
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 COPY . .
 
+# Set environment variables
 ENV PYTHONPATH=/app
 ENV TF_CPP_MIN_LOG_LEVEL=3
 
+# Create non-root user
 RUN useradd -m trader && chown -R trader:trader /app
-RUN mkdir -p /app/model_storage && chown trader:trader /app/model_storage
-    
-VOLUME /app/model_storage
-
 USER trader
 
+# Start the application
 CMD ["python", "main.py"]

@@ -23,6 +23,8 @@ class LSTMStrategy:
         self.preprocessor = DataPreprocessor()
         self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)  # 12 features
         self.model = self._initialize_model()
+        self.current_position = None  # Track open positions: None/"long"/"short"
+        self.last_trade_time = None
         self.analyzer = SentimentIntensityAnalyzer()
         self.last_retrain = None
         self.data_ready = False
@@ -72,44 +74,47 @@ class LSTMStrategy:
             logger.warning("Model validation failed", error=str(e))
             return False
 
+    # app/strategies/lstm_strategy.py
     async def _check_data_availability(self):
-        """Check data readiness by ensuring enough aggregated bars."""
+        """Check data readiness with fixed time window"""
         if not self.data_ready:
             if not self.warmup_start_time:
+                # Initialize warmup parameters
                 self.warmup_start_time = time.time()
+                self.warmup_data_start = datetime.utcnow()  # Fixed start point
                 logger.info("Warmup phase started")
+                self.progress_bar = ProgressBar(total=self.min_samples)
 
-            count_result = await Database.fetch(
-                "SELECT COUNT(DISTINCT time_bucket('1 minute', time)) as count FROM market_data"
-            )
-            final_count = count_result[0]['count'] if count_result else 0
+            # Always use initial warmup start time for queries
+            records = await Database.fetchval('''
+                SELECT COUNT(DISTINCT time_bucket('1 minute', time)) 
+                FROM market_data 
+                WHERE time > $1
+            ''', self.warmup_data_start)
 
-            self.progress_bar.update(final_count)
+            current_count = records or 0
+            elapsed_time = time.time() - self.warmup_start_time
 
-            data_progress = final_count / self.min_samples
-            elapsed = time.time() - self.warmup_start_time
-            time_progress = elapsed / Config.MODEL_CONFIG['warmup_period']
+            # Update progress
+            self.progress_bar.update(current_count)
 
-            overall_progress = min(data_progress, time_progress) * 100
-
-            logger.info(
-                "Warmup Progress",
-                aggregator_rows=final_count,
-                required_rows=self.min_samples,
-                data_progress=f"{data_progress*100:.1f}%",
-                time_elapsed=int(elapsed),
-                time_required=Config.MODEL_CONFIG['warmup_period'],
-                time_progress=f"{time_progress*100:.1f}%",
-                overall_progress=f"{overall_progress:.1f}%"
-            )
-
-            if final_count >= self.min_samples and elapsed >= Config.MODEL_CONFIG['warmup_period']:
+            # Completion check
+            if current_count >= self.min_samples or elapsed_time >= Config.MODEL_CONFIG['warmup_period']:
                 self.data_ready = True
-                self.progress_bar.clear()
-                logger.info("Warmup complete - Starting trading")
+                self.progress_bar.update(self.min_samples)  # Force 100%
+                logger.info("Warmup requirements met", 
+                        samples=current_count,
+                        duration=elapsed_time)
                 return True
 
+            # Log current state
+            logger.info("Warmup status",
+                    samples=current_count,
+                    required=self.min_samples,
+                    elapsed=f"{elapsed_time:.1f}s",
+                    remaining=f"{Config.MODEL_CONFIG['warmup_period']-elapsed_time:.1f}s")
             return False
+        
         return True
 
     async def get_historical_data(self):
@@ -207,7 +212,7 @@ class LSTMStrategy:
                 return None
 
             # Use the new prepare_data method to get X and y.
-            X, _ = self.preprocessor.prepare_data(df)
+            X, _ = self.preprocessor.prepare_training_data (df)
             # Log the shape for debugging purposes
             logger.info("Prediction input shape", shape=X.shape)
 
@@ -221,72 +226,98 @@ class LSTMStrategy:
             logger.error("Prediction failed", error=str(e))
             return None
 
-
     async def execute_trades(self):
-        """Execute trades with dynamic thresholds and SL/TP based on volatility."""
+        """Execute trades based on model predictions and risk parameters"""
         try:
+            if not self.model_loaded:
+                logger.warning("Skipping trades - model not loaded")
+                return
+
+            # Check for existing position
+            if self.current_position is not None:
+                logger.info("Skipping trade - existing position", 
+                            position=self.current_position)
+                return
+
+            # Get prediction and current price
             prediction = await self.get_prediction()
             current_price = await self.trade_service.get_current_price()
-
+            
             if prediction is None or current_price is None:
                 return
 
-            # Calculate dynamic thresholds based on volatility from historical close prices.
-            df = await self.get_historical_data()
-            # Calculate volatility as the standard deviation of percent changes
-            volatility = df['close'].pct_change().std()
-            
-            # Define dynamic thresholds (you may adjust the multiplier as needed)
-            buy_threshold = 1 + (volatility * 1.5)
-            sell_threshold = 1 - (volatility * 1.5)
+            # Calculate risk parameters based on direction
+            if prediction > current_price * 1.02:  # Long signal
+                stop_loss = current_price * 0.97   # 3% below entry
+                take_profit = current_price * 1.05  # 5% above entry
+                await self._execute_trade(
+                    side='Buy',
+                    price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                self.current_position = "long"
 
-            # Determine stop loss and take profit levels.
-            # For a Buy trade:
-            #   SL is set below the current price by one volatility unit.
-            #   TP is set above the current price by two volatility units.
-            # For a Sell trade, the levels are reversed.
-            if prediction > current_price * buy_threshold:
-                stop_loss = current_price * (1 - volatility)   # e.g. if volatility is 2%, SL is 98% of current price.
-                take_profit = current_price * (1 + volatility * 2) # e.g. TP is 104% if volatility is 2%
-                await self._execute_trade('Buy', current_price, stop_loss=stop_loss, take_profit=take_profit)
-            elif prediction < current_price * sell_threshold:
-                stop_loss = current_price * (1 + volatility)   # For sell, a stop loss above current price.
-                take_profit = current_price * (1 - volatility * 2) # Take profit below current price.
-                await self._execute_trade('Sell', current_price, stop_loss=stop_loss, take_profit=take_profit)
+            elif prediction < current_price * 0.98:  # Short signal
+                stop_loss = current_price * 1.03    # 3% above entry
+                take_profit = current_price * 0.95  # 5% below entry
+                await self._execute_trade(
+                    side='Sell',
+                    price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                self.current_position = "short"
 
         except Exception as e:
-            logger.error("Trade execution failed", error=str(e))
+            logger.error("Trade execution error", error=str(e))
+
 
     async def _execute_trade(self, side: str, price: float, stop_loss: float = None, take_profit: float = None):
         """
-        Validate the calculated position size before trading.
-        If the position size meets the minimum requirement, execute the trade
-        with optional stop loss (SL) and take profit (TP) levels.
+        Execute trade with proper risk management and position tracking.
         
-        :param side: 'Buy' or 'Sell'
-        :param price: Current market price
-        :param stop_loss: Optional stop loss level
-        :param take_profit: Optional take profit level
+        Args:
+            side: 'Buy' or 'Sell'
+            price: Current market price
+            stop_loss: Stop loss level (absolute price)
+            take_profit: Take profit level (absolute price)
         """
-        position_size = self._calculate_position_size(price)
-        if position_size >= self.trade_service.min_qty:
+        try:
+            # Validate minimum order quantity
+            if self.trade_service.position_size < self.trade_service.min_qty:
+                logger.warning(
+                    "Position size below minimum",
+                    calculated=self.trade_service.position_size,
+                    required=self.trade_service.min_qty
+                )
+                return
+
             logger.info(
                 "Executing trade",
                 side=side,
                 price=price,
-                position_size=position_size,
+                position_size=self.trade_service.position_size,
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )
+
+            # Execute trade through trade service
             await self.trade_service.execute_trade(
-                price, side, position_size, stop_loss=stop_loss, take_profit=take_profit
+                side=side,
+                price=price,
+                stop_loss=stop_loss,
+                take_profit=take_profit
             )
-        else:
-            logger.warning(
-                "Position size below minimum",
-                calculated=position_size,
-                required=self.trade_service.min_qty
-            )
+
+            # Update position tracking
+            self.current_position = side.lower()
+            self.last_trade_time = time.time()
+
+        except Exception as e:
+            logger.error("Trade execution failed", error=str(e))
+            self.current_position = None
+            raise
 
 
     def _calculate_position_size(self, current_price):
