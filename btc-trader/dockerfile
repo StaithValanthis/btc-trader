@@ -10,17 +10,22 @@ RUN apt-get update && apt-get install -y \
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 # Copy application code
 COPY . .
 
+# Set environment variables
 # Set environment variables
 ENV PYTHONPATH=/app
 ENV TF_CPP_MIN_LOG_LEVEL=3
 
 # Create non-root user
+# Create non-root user
 RUN useradd -m trader && chown -R trader:trader /app
 USER trader
 
+# Start the application
 # Start the application
 CMD ["python", "main.py"]

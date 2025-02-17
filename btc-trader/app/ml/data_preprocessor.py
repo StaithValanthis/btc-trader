@@ -9,6 +9,7 @@ logger = get_logger(__name__)
 
 class DataPreprocessor:
     def __init__(self, lookback=60, prediction_window=30):
+    def __init__(self, lookback=60, prediction_window=30):
         self.lookback = lookback
         self.prediction_window = prediction_window
         self.scaler = MinMaxScaler(feature_range=(0, 1))
@@ -57,13 +58,31 @@ class DataPreprocessor:
             # Forward fill missing values instead of dropping
             df.ffill(inplace=True)
             df.bfill(inplace=True)
+            # Calculate indicators with error handling
+            try:
+                df['rsi'] = self._calculate_rsi(df['close'], period=14)
+                df['macd'], df['signal'] = self._calculate_macd(df['close'])
+                df['upper_band'], df['lower_band'] = self._calculate_bollinger_bands(df['close'])
+                df['atr'] = self._calculate_atr(df['high'], df['low'], df['close'])
+                df['vwap'] = self._calculate_vwap(df['close'], df['volume'])
+            except Exception as e:
+                logger.error("Indicator calculation failed", error=str(e))
+                return pd.DataFrame()
 
+            # Forward fill missing values instead of dropping
+            df.ffill(inplace=True)
+            df.bfill(inplace=True)
+
+            # Verify all required columns are present
             # Verify all required columns are present
             missing = set(self.required_columns) - set(df.columns)
             if missing:
                 logger.error("Missing calculated columns", columns=missing)
                 return pd.DataFrame()
+                logger.error("Missing calculated columns", columns=missing)
+                return pd.DataFrame()
 
+            return df
             return df
 
         except Exception as e:
@@ -156,6 +175,7 @@ class DataPreprocessor:
 
         return np.array(X), np.array(y)
         
+    def prepare_prediction_data(self, df: pd.DataFrame):
     def prepare_prediction_data(self, df: pd.DataFrame):
         """
         Prepare prediction data with the correct lookback window.

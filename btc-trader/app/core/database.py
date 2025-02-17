@@ -1,4 +1,5 @@
 # app/core/database.py
+# app/core/database.py
 import asyncio
 import asyncpg
 from structlog import get_logger
@@ -15,9 +16,11 @@ class Database:
     async def initialize(cls):
         """
         Initialize database connection pool and create tables with TimescaleDB optimizations
+        Initialize database connection pool and create tables with TimescaleDB optimizations
         """
         for attempt in range(cls._max_retries):
             try:
+                logger.info(f"Database connection attempt {attempt+1}/{cls._max_retries}")
                 logger.info(f"Database connection attempt {attempt+1}/{cls._max_retries}")
                 cls._pool = await asyncpg.create_pool(
                     **Config.DB_CONFIG,
@@ -29,8 +32,10 @@ class Database:
 
                 async with cls._pool.acquire() as conn:
                     # Create TimescaleDB extension
+                    # Create TimescaleDB extension
                     await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;')
 
+                    # Market data table
                     # Market data table
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS market_data (
@@ -66,9 +71,15 @@ class Database:
                             'time',
                             if_not_exists => TRUE,
                             chunk_time_interval => INTERVAL '1 day'
+                            if_not_exists => TRUE,
+                            chunk_time_interval => INTERVAL '1 day'
                         );
                     ''')
 
+                    # Configure compression
+                    await cls._configure_compression(conn)
+
+                logger.info("Database initialized successfully")
                     # Configure compression
                     await cls._configure_compression(conn)
 
@@ -78,7 +89,65 @@ class Database:
             except Exception as e:
                 if attempt == cls._max_retries - 1:
                     logger.error("Database initialization failed", error=str(e))
+                    logger.error("Database initialization failed", error=str(e))
                     raise
+                wait_time = cls._base_delay ** attempt
+                logger.warning("Retrying database connection", wait_seconds=wait_time)
+                await asyncio.sleep(wait_time)
+
+    @classmethod
+    async def _configure_compression(cls, conn):
+        """Configure TimescaleDB compression policies safely"""
+        try:
+            # Market data compression
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM timescaledb_information.compression_settings 
+                        WHERE hypertable_name = 'market_data'
+                    ) THEN
+                        ALTER TABLE market_data SET (
+                            timescaledb.compress,
+                            timescaledb.compress_orderby = 'time DESC',
+                            timescaledb.compress_segmentby = 'trade_id'
+                        );
+                    END IF;
+                    
+                    PERFORM add_compression_policy(
+                        'market_data', 
+                        INTERVAL '7 days',
+                        if_not_exists => true
+                    );
+                END $$;
+            ''')
+
+            # Trades compression
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM timescaledb_information.compression_settings 
+                        WHERE hypertable_name = 'trades'
+                    ) THEN
+                        ALTER TABLE trades SET (
+                            timescaledb.compress,
+                            timescaledb.compress_orderby = 'time DESC'
+                        );
+                    END IF;
+                    
+                    PERFORM add_compression_policy(
+                        'trades',
+                        INTERVAL '7 days',
+                        if_not_exists => true
+                    );
+                END $$;
+            ''')
+            logger.info("Compression configured safely")
+        except Exception as e:
+            logger.error("Compression configuration error", error=str(e))
+            raise
+        
                 wait_time = cls._base_delay ** attempt
                 logger.warning("Retrying database connection", wait_seconds=wait_time)
                 await asyncio.sleep(wait_time)
@@ -149,6 +218,7 @@ class Database:
         """Execute a SQL command"""
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.execute(query, *args)
 
@@ -156,6 +226,7 @@ class Database:
     async def fetch(cls, query, *args):
         """Fetch multiple rows"""
         if not cls._pool:
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetch(query, *args)
@@ -165,6 +236,7 @@ class Database:
         """Fetch a single row"""
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
@@ -172,6 +244,7 @@ class Database:
     async def fetchval(cls, query, *args):
         """Fetch a single value"""
         if not cls._pool:
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetchval(query, *args)
