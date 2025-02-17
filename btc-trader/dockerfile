@@ -1,23 +1,6 @@
-# Stage 1: Build TA-Lib
-FROM python:3.11-slim AS talib-builder
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
-    && tar -xvzf ta-lib-0.4.0-src.tar.gz \
-    && cd ta-lib/ \
-    && ./configure --prefix=/usr \
-    && make \
-    && make install
-
-# Stage 2: Final Image
+# Stage 1: Final Image
 FROM python:3.11-slim
 WORKDIR /app
-
-# Copy TA-Lib artifacts from the builder stage
-COPY --from=talib-builder /usr/lib/libta_lib.* /usr/lib/
-COPY --from=talib-builder /usr/include/ta-lib/ /usr/include/ta-lib/
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

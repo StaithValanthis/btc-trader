@@ -1,3 +1,5 @@
+# File: app/core/bybit_client.py
+
 import json
 import asyncio
 import websockets

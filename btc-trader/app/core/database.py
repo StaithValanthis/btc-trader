@@ -46,7 +46,7 @@ class Database:
                             'market_data', 
                             'time', 
                             if_not_exists => TRUE,
-                            chunk_time_interval => INTERVAL '1 hour'
+                            chunk_time_interval => INTERVAL '1 day'
                         );
                     ''')
 

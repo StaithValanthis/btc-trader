@@ -9,6 +9,8 @@ import time
 
 nest_asyncio.apply()
 
+# File: app/init.py
+
 class TradingBot:
     def __init__(self):
         self.bybit = BybitMarketData()
@@ -22,7 +24,6 @@ class TradingBot:
             await StartupChecker.run_checks()
             
             logger.info("Initializing database...")
-            await StartupChecker.run_checks()
             await Database.initialize()
             await self.trade_service.initialize()
             
@@ -31,7 +32,7 @@ class TradingBot:
             
             await asyncio.gather(
                 self.bybit.run(),
-                self.strategy.run(),
+                self.strategy.run(),  # Ensure this is awaited
                 self._monitor_system()
             )
         except Exception as e:

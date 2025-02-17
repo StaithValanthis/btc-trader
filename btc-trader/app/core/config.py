@@ -15,7 +15,8 @@ def get_env_variable(name, default):
     try:
         return float(value)
     except ValueError:
-        return value
+        logger.warning(f"Invalid float value for {name}, using default: {default}")
+        return default  # Return default on failure instead of original value
 
 class Config:
     DB_CONFIG = {

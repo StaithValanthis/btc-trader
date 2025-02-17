@@ -32,13 +32,13 @@ class DataPreprocessor:
         return df
 
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create features with robust error handling"""
+        """Create features with robust error handling."""
         try:
             if df.empty:
                 logger.warning("Input DataFrame is empty")
                 return df
 
-            # Ensure required columns exist
+            # Ensure required base columns exist
             required_cols = ['open', 'high', 'low', 'close', 'volume']
             if not all(col in df.columns for col in required_cols):
                 raise ValueError(f"Missing required columns: {set(required_cols) - set(df.columns)}")
@@ -128,75 +128,52 @@ class DataPreprocessor:
         vwap = cum_vol_price / cum_vol
         return vwap
 
-    def prepare_training_data (self, df):
+    def prepare_training_data(self, df):
         """
-        Prepare the input sequences (X) and target values (y) for LSTM training.
-        
-        Args:
-            df (pd.DataFrame): DataFrame with features created by create_features.
-            
-        Returns:
-            tuple: (X, y) where X is a numpy array of input sequences and y is a numpy array of targets.
+        Prepare training data with the correct lookback window.
         """
         if df.empty:
-            logger.warning("Input DataFrame is empty in prepare_data")
+            logger.warning("Input DataFrame is empty")
             return np.array([]), np.array([])
-        
-        # Check for required columns
+
+        # Ensure required columns exist
         missing_cols = set(self.required_columns) - set(df.columns)
         if missing_cols:
-            logger.error("Missing required columns in prepare_data", missing=missing_cols)
+            logger.error("Missing required columns", missing=missing_cols)
             return np.array([]), np.array([])
-        
-        # Extract features and fit scaler
+
+        # Extract features and scale
         features = df[self.required_columns]
         scaled_features = self.scaler.fit_transform(features)
-        
-        # Determine the index of the 'close' price in the features
-        close_index = self.required_columns.index('close')
-        
-        X = []
-        y = []
-        
-        # Generate sequences
+
+        # Generate sequences with the correct lookback window
+        X, y = [], []
         for i in range(len(scaled_features) - self.lookback - self.prediction_window + 1):
-            # Input sequence (lookback steps)
             X_seq = scaled_features[i:i + self.lookback]
-            # Target (prediction_window steps ahead)
-            y_value = scaled_features[i + self.lookback + self.prediction_window - 1][close_index]
+            y_value = scaled_features[i + self.lookback + self.prediction_window - 1][self.required_columns.index('close')]
             X.append(X_seq)
             y.append(y_value)
-        
+
         return np.array(X), np.array(y)
         
     def prepare_prediction_data(self, df: pd.DataFrame):
         """
-        Prepare training (or prediction) data using a sliding window.
-        Assumes that the DataFrame already contains the required features
-        in the following order (as defined by self.required_columns):
-          - base_columns: ['open', 'high', 'low', 'close', 'volume']
-          - indicator_columns: ['rsi', 'macd', 'signal', 'upper_band', 'lower_band', 'atr', 'vwap']
-        
-        The output X will have shape (n_samples, lookback_window, 12)
-        and y is taken as the 'close' value immediately after the window.
+        Prepare prediction data with the correct lookback window.
         """
-        from app.core.config import Config  # ensure you have access to configuration
-        lookback = Config.MODEL_CONFIG['lookback_window']  # typically 60
+        if df.empty:
+            logger.warning("Input DataFrame is empty")
+            return np.array([]), np.array([])
 
-        # Ensure that df contains all required columns
-        missing = set(self.required_columns) - set(df.columns)
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
+        # Ensure required columns exist
+        missing_cols = set(self.required_columns) - set(df.columns)
+        if missing_cols:
+            logger.error("Missing required columns", missing=missing_cols)
+            return np.array([]), np.array([])
 
-        # Reorder the DataFrame columns to match the required order
-        df = df[self.required_columns]
-        data = df.values  # shape: (num_rows, 12)
+        # Extract features and scale
+        features = df[self.required_columns]
+        scaled_features = self.scaler.transform(features)
 
-        X, y = [], []
-        # Create sliding windows. We use the next 'close' value (column index 3) as the target.
-        for i in range(len(data) - lookback):
-            X.append(data[i:i + lookback])
-            y.append(data[i + lookback][3])
-        X = np.array(X)
-        y = np.array(y)
-        return X, y
+        # Use the last `lookback` samples for prediction
+        X = scaled_features[-self.lookback:]
+        return np.array([X]), np.array([])  # Return X as a batch of 1 sample

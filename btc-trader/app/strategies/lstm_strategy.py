@@ -20,8 +20,8 @@ logger = get_logger(__name__)
 class LSTMStrategy:
     def __init__(self, trade_service: TradeService):
         self.trade_service = trade_service
-        self.preprocessor = DataPreprocessor()
-        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], 12)  # 12 features
+        self.preprocessor = DataPreprocessor(lookback=Config.MODEL_CONFIG['lookback_window'])
+        self.input_shape = (Config.MODEL_CONFIG['lookback_window'], len(self.preprocessor.required_columns))
         self.model = self._initialize_model()
         self.current_position = None  # Track open positions: None/"long"/"short"
         self.last_trade_time = None
@@ -34,22 +34,46 @@ class LSTMStrategy:
         self.min_samples = Config.MODEL_CONFIG['min_training_samples']
         self.progress_bar = ProgressBar(total=self.min_samples)
 
+    async def run(self):
+        """Main strategy loop."""
+        logger.info("Strategy thread started")
+        while True:
+            try:
+                # Data readiness check
+                if not await self._check_data_availability():
+                    await asyncio.sleep(30)
+                    continue
+
+                # Regular retraining
+                if self._should_retrain():
+                    await self.retrain_model()
+
+                # Trading operations
+                await self.execute_trades()
+                await self.log_market_analysis()
+
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error("Strategy loop error", error=str(e))
+                await asyncio.sleep(10)
+
     def _initialize_model(self):
-        """Initialize or load LSTM model with validation."""
         model_path = "model_storage/lstm_model.keras"
         try:
             if os.path.exists(model_path) and self._validate_model_file(model_path):
                 logger.info("Loading validated model", path=model_path)
                 model = LSTMModel(self.input_shape)
                 model.load(model_path)
-                self.model_loaded = True
+                self.model_loaded = True  # Ensure this is set
                 logger.info("Model loaded successfully")
                 return model
             else:
                 logger.warning("No valid model found, initializing new model")
+                self.model_loaded = False  # Explicit state
                 return LSTMModel(self.input_shape)
         except Exception as e:
             logger.error("Model initialization failed", error=str(e))
+            self.model_loaded = False
             return LSTMModel(self.input_shape)
 
     def _validate_model_file(self, path):
@@ -74,7 +98,6 @@ class LSTMStrategy:
             logger.warning("Model validation failed", error=str(e))
             return False
 
-    # app/strategies/lstm_strategy.py
     async def _check_data_availability(self):
         """Check data readiness with fixed time window"""
         if not self.data_ready:
@@ -155,77 +178,78 @@ class LSTMStrategy:
 
             if len(df) < self.min_samples:
                 logger.warning("Insufficient data after feature creation",
-                               initial=len(records),
-                               processed=len(df))
+                            initial=len(records),
+                            processed=len(df))
 
             return df
 
         except Exception as e:
             logger.error("Data retrieval failed", error=str(e))
             return pd.DataFrame()
-
+    
     async def retrain_model(self):
         """Robust model retraining with fallbacks."""
         try:
             df = await self.get_historical_data()
+            logger.info("Retraining model", input_shape=self.input_shape, data_samples=len(df))
             if len(df) < Config.MODEL_CONFIG['min_training_samples']:
                 logger.warning("Insufficient processed data",
-                               available=len(df),
-                               required=Config.MODEL_CONFIG['min_training_samples'])
+                            available=len(df),
+                            required=Config.MODEL_CONFIG['min_training_samples'])
                 return
 
-            # Adjust lookback window if needed
-            if len(df) < Config.MODEL_CONFIG['lookback_window'] * 2:
+            # Adjust lookback window dynamically
+            new_lookback = Config.MODEL_CONFIG['lookback_window']
+            if len(df) < new_lookback * 2:
                 new_lookback = min(30, len(df) // 2)
-                logger.info("Adjusting lookback window",
-                             old=Config.MODEL_CONFIG['lookback_window'],
-                             new=new_lookback)
-                self.model.input_shape = (new_lookback, 12)
+                logger.info("Adjusting lookback window", old=Config.MODEL_CONFIG['lookback_window'], new=new_lookback)
+            
+            # Reinitialize model with the correct input shape
+            self.input_shape = (new_lookback, len(self.preprocessor.required_columns))
+            self.model = LSTMModel(self.input_shape)  # Rebuild model
 
-            X, y = self.preprocessor.prepare_data(df)
+            # Prepare data with the new lookback window
+            X, y = self.preprocessor.prepare_training_data(df)
             if X.shape[0] == 0:
                 raise ValueError("Empty training data after preprocessing")
 
             self.model.train(X, y)
             self.model.save("model_storage/lstm_model.keras")
             self.model_loaded = True
-            logger.info("Model retrained successfully",
-                         training_samples=X.shape[0])
-    
+            self.last_retrain = time.time()
+            logger.info("Model retrained successfully", training_samples=X.shape[0])
         except Exception as e:
             logger.error("Retraining failed", error=str(e))
-            if os.path.exists("model_storage/lstm_model.keras"):
-                self.model.load("model_storage/lstm_model.keras")
-                self.model_loaded = True
-
-        finally:
-                self.last_retrain = time.time()  # Update here to mark retrain time
-                
+            self.model_loaded = False
+                        
     async def get_prediction(self):
-        """Use the model to generate a next price prediction from aggregator data."""
+        """Generate predictions with shape validation."""
         try:
             if not self.model_loaded:
+                logger.warning("Model not loaded, skipping prediction.")
                 return None
 
             df = await self.get_historical_data()
             if df.empty:
+                logger.warning("No historical data available for prediction.")
                 return None
 
-            # Use the new prepare_data method to get X and y.
-            X, _ = self.preprocessor.prepare_training_data (df)
-            # Log the shape for debugging purposes
-            logger.info("Prediction input shape", shape=X.shape)
-
-            # Expecting X to have shape (n_samples, 60, 12). Take the last sample for prediction.
-            if X.shape[0] == 0:
+            # Prepare data with the correct lookback window
+            X, _ = self.preprocessor.prepare_prediction_data(df)
+            if X.shape[1:] != self.input_shape:
+                logger.error(
+                    "Prediction input shape mismatch",
+                    expected=self.input_shape,
+                    actual=X.shape[1:]
+                )
                 return None
 
-            pred = self.model.predict(X[-1:]).flatten()
-            return pred
+            pred = self.model.predict(X)
+            return pred.flatten()
         except Exception as e:
             logger.error("Prediction failed", error=str(e))
             return None
-
+        
     async def execute_trades(self):
         """Execute trades based on model predictions and risk parameters"""
         try:
@@ -248,133 +272,82 @@ class LSTMStrategy:
 
             # Calculate risk parameters based on direction
             if prediction > current_price * 1.02:  # Long signal
-                stop_loss = current_price * 0.97   # 3% below entry
-                take_profit = current_price * 1.05  # 5% above entry
                 await self._execute_trade(
                     side='Buy',
                     price=current_price,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
+                    stop_loss=current_price * 0.97,
+                    take_profit=current_price * 1.05
                 )
-                self.current_position = "long"
 
             elif prediction < current_price * 0.98:  # Short signal
-                stop_loss = current_price * 1.03    # 3% above entry
-                take_profit = current_price * 0.95  # 5% below entry
                 await self._execute_trade(
                     side='Sell',
                     price=current_price,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
+                    stop_loss=current_price * 1.03,
+                    take_profit=current_price * 0.95
                 )
-                self.current_position = "short"
 
         except Exception as e:
             logger.error("Trade execution error", error=str(e))
 
-
-    async def _execute_trade(self, side: str, price: float, stop_loss: float = None, take_profit: float = None):
-        """
-        Execute trade with proper risk management and position tracking.
-        
-        Args:
-            side: 'Buy' or 'Sell'
-            price: Current market price
-            stop_loss: Stop loss level (absolute price)
-            take_profit: Take profit level (absolute price)
-        """
+    async def _execute_trade(self, side: str, price: float, stop_loss: float, take_profit: float):
+        """Implementation added here"""
         try:
-            # Validate minimum order quantity
-            if self.trade_service.position_size < self.trade_service.min_qty:
-                logger.warning(
-                    "Position size below minimum",
-                    calculated=self.trade_service.position_size,
-                    required=self.trade_service.min_qty
-                )
-                return
-
             logger.info(
-                "Executing trade",
+                "Attempting to execute trade",
                 side=side,
                 price=price,
-                position_size=self.trade_service.position_size,
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )
-
-            # Execute trade through trade service
+            
             await self.trade_service.execute_trade(
                 side=side,
                 price=price,
                 stop_loss=stop_loss,
                 take_profit=take_profit
             )
-
-            # Update position tracking
+            
             self.current_position = side.lower()
             self.last_trade_time = time.time()
-
+            logger.info("Trade executed successfully", position=self.current_position)
+            
         except Exception as e:
             logger.error("Trade execution failed", error=str(e))
             self.current_position = None
             raise
 
 
-    def _calculate_position_size(self, current_price):
-        """Risk-based position sizing."""
-        account_balance = 10000  # placeholder
-        risk_percent = 0.02
-        dollar_risk = account_balance * risk_percent
-        return min(dollar_risk / current_price, Config.TRADING_CONFIG['position_size'])
-
-    async def run(self):
-        """Main strategy loop."""
-        logger.info("Strategy thread started")
-        while True:
-            try:
-                # Data readiness check
-                if not await self._check_data_availability():
-                    await asyncio.sleep(30)
-                    continue
-
-                # Regular retraining
-                if self._should_retrain():
-                    await self.retrain_model()
-
-                # Trading operations
-                await self.execute_trades()
-                await self.log_market_analysis()
-
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.error("Strategy loop error", error=str(e))
-                await asyncio.sleep(10)
-
     def _should_retrain(self):
+        """Determine if the model should be retrained based on time since last training."""
         if not self.last_retrain:
             logger.info("No previous retrain; should retrain now.")
             return True
         elapsed = time.time() - self.last_retrain
-        logger.info("Time since last retrain", elapsed=elapsed, retrain_interval=Config.MODEL_CONFIG['retrain_interval'])
+        logger.info("Time since last retrain", 
+                    elapsed=elapsed, 
+                    retrain_interval=Config.MODEL_CONFIG['retrain_interval'])
         return elapsed > Config.MODEL_CONFIG['retrain_interval']
-
-
+    
     async def log_market_analysis(self):
-        """Periodic logging of sentiment & model predictions."""
-        if time.time() - self.last_log_time >= 300:
-            try:
-                sentiment = await self.fetch_sentiment()
-                prediction = await self.get_prediction()
-                logger.info(
-                    "Market Snapshot",
-                    sentiment_score=sentiment,
-                    last_prediction=float(prediction[0]) if prediction is not None and len(prediction) else None,
-                    model_confidence=float(np.std(prediction)) if prediction is not None and len(prediction) else None
-                )
-                self.last_log_time = time.time()
-            except Exception as e:
-                logger.error("Market analysis failed", error=str(e))
+        """Log market analysis including sentiment and predictions."""
+        try:
+            sentiment = await self.fetch_sentiment()
+            prediction = await self.get_prediction()
+            logger.info(
+                "Market Snapshot",
+                sentiment_score=sentiment,
+                last_prediction=float(prediction[0]) if prediction is not None and len(prediction) else None,
+                model_confidence=float(np.std(prediction)) if prediction is not None and len(prediction) else None
+            )
+        except Exception as e:
+            logger.error("Market analysis failed", error=str(e))
 
     async def fetch_sentiment(self):
-        """Placeholder for real sentiment data."""
-        return np.random.uniform(-1, 1)
+        """Fetch sentiment data (placeholder for real implementation)."""
+        try:
+            # Placeholder for actual sentiment analysis
+            return np.random.uniform(-1, 1)
+        except Exception as e:
+            logger.error("Failed to fetch sentiment", error=str(e))
+            return 0.0

@@ -22,18 +22,14 @@ class LSTMModel:
 
     def build_model(self):
         """
-        Build the LSTM model with optional Conv1D layer.
+        Build the LSTM model with dynamic input shape.
         """
         model = Sequential()
-        # Example: small 1D conv for local pattern extraction:
-        model.add(Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=self.input_shape))
-        model.add(MaxPooling1D(pool_size=2))
-        model.add(Bidirectional(LSTM(64, return_sequences=True)))
+        model.add(Bidirectional(LSTM(64, return_sequences=True, input_shape=self.input_shape)))
         model.add(Dropout(0.2))
-        model.add(LSTM(32, return_sequences=False))
+        model.add(Bidirectional(LSTM(32)))
         model.add(Dropout(0.2))
-        model.add(Dense(16, activation='relu'))
-        model.add(Dense(1))  # Predict next closing price
+        model.add(Dense(1))
         return model
 
     def train(self, X_train, y_train, epochs=50, batch_size=32):
