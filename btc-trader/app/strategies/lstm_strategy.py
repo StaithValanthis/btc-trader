@@ -8,7 +8,6 @@ import os
 from datetime import datetime, timedelta
 from structlog import get_logger
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-
 from app.core import Config, Database
 from app.services.trade_service import TradeService
 from app.ml.data_preprocessor import DataPreprocessor
@@ -23,8 +22,6 @@ class LSTMStrategy:
         self.preprocessor = DataPreprocessor(lookback=Config.MODEL_CONFIG['lookback_window'])
         self.input_shape = (Config.MODEL_CONFIG['lookback_window'], len(self.preprocessor.required_columns))
         self.model = self._initialize_model()
-        self.current_position = None  # Track open positions: None/"long"/"short"
-        self.last_trade_time = None
         self.current_position = None  # Track open positions: None/"long"/"short"
         self.last_trade_time = None
         self.analyzer = SentimentIntensityAnalyzer()
@@ -102,14 +99,11 @@ class LSTMStrategy:
 
     # app/strategies/lstm_strategy.py
     async def _check_data_availability(self):
-        """Check data readiness with fixed time window"""
-        """Check data readiness with fixed time window"""
+        """Check data readiness with fixed time window"""        
         if not self.data_ready:
             if not self.warmup_start_time:
-                # Initialize warmup parameters
-                # Initialize warmup parameters
+                # Initialize warmup parameters               
                 self.warmup_start_time = time.time()
-                self.warmup_data_start = datetime.utcnow()  # Fixed start point
                 self.warmup_data_start = datetime.utcnow()  # Fixed start point
                 logger.info("Warmup phase started")
                 self.progress_bar = ProgressBar(total=self.min_samples)
@@ -120,14 +114,7 @@ class LSTMStrategy:
                 FROM market_data 
                 WHERE time > $1
             ''', self.warmup_data_start)
-                self.progress_bar = ProgressBar(total=self.min_samples)
-
-            # Always use initial warmup start time for queries
-            records = await Database.fetchval('''
-                SELECT COUNT(DISTINCT time_bucket('1 minute', time)) 
-                FROM market_data 
-                WHERE time > $1
-            ''', self.warmup_data_start)
+            self.progress_bar = ProgressBar(total=self.min_samples)
 
             current_count = records or 0
             elapsed_time = time.time() - self.warmup_start_time
@@ -135,13 +122,6 @@ class LSTMStrategy:
             # Update progress
             self.progress_bar.update(current_count)
 
-            # Completion check
-            if current_count >= self.min_samples or elapsed_time >= Config.MODEL_CONFIG['warmup_period']:
-            current_count = records or 0
-            elapsed_time = time.time() - self.warmup_start_time
-
-            # Update progress
-            self.progress_bar.update(current_count)
 
             # Completion check
             if current_count >= self.min_samples or elapsed_time >= Config.MODEL_CONFIG['warmup_period']:
@@ -156,12 +136,6 @@ class LSTMStrategy:
                         duration=elapsed_time)
                 return True
 
-            # Log current state
-            logger.info("Warmup status",
-                    samples=current_count,
-                    required=self.min_samples,
-                    elapsed=f"{elapsed_time:.1f}s",
-                    remaining=f"{Config.MODEL_CONFIG['warmup_period']-elapsed_time:.1f}s")
             # Log current state
             logger.info("Warmup status",
                     samples=current_count,
@@ -284,19 +258,6 @@ class LSTMStrategy:
             return None
         
     async def execute_trades(self):
-        """Execute trades based on model predictions and risk parameters"""
-        try:
-            if not self.model_loaded:
-                logger.warning("Skipping trades - model not loaded")
-                return
-
-            # Check for existing position
-            if self.current_position is not None:
-                logger.info("Skipping trade - existing position", 
-                            position=self.current_position)
-                return
-
-            # Get prediction and current price
         """Execute trades based on model predictions and risk parameters"""
         try:
             if not self.model_loaded:
