@@ -1,4 +1,4 @@
-# app/core/database.py
+# File: app/core/database.py
 import asyncio
 import asyncpg
 from structlog import get_logger
@@ -28,7 +28,7 @@ class Database:
                     # Create TimescaleDB extension
                     await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;')
 
-                    # Create market_data table
+                    # market_data table
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS market_data (
                             time TIMESTAMPTZ NOT NULL,
@@ -38,8 +38,6 @@ class Database:
                             PRIMARY KEY (time, trade_id)
                         );
                     ''')
-
-                    # Convert to hypertable
                     await conn.execute('''
                         SELECT create_hypertable(
                             'market_data', 
@@ -49,7 +47,7 @@ class Database:
                         );
                     ''')
 
-                    # Create trades table
+                    # trades table
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS trades (
                             time TIMESTAMPTZ NOT NULL,
@@ -57,6 +55,27 @@ class Database:
                             price DOUBLE PRECISION NOT NULL,
                             quantity DOUBLE PRECISION NOT NULL,
                             PRIMARY KEY (time, side, price)
+                        );
+                    ''')
+
+                    # NEW: candles table
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS candles (
+                            time TIMESTAMPTZ NOT NULL,
+                            open DOUBLE PRECISION NOT NULL,
+                            high DOUBLE PRECISION NOT NULL,
+                            low DOUBLE PRECISION NOT NULL,
+                            close DOUBLE PRECISION NOT NULL,
+                            volume DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (time)
+                        );
+                    ''')
+                    await conn.execute('''
+                        SELECT create_hypertable(
+                            'candles',
+                            'time',
+                            if_not_exists => TRUE,
+                            chunk_time_interval => INTERVAL '1 day'
                         );
                     ''')
 
@@ -71,13 +90,13 @@ class Database:
         """Close the database connection pool."""
         if cls._pool:
             await cls._pool.close()
-            logger.info("Database connection pool closed")   
+            logger.info("Database connection pool closed")
 
     @classmethod
     async def execute(cls, query, *args):
         """Execute a SQL command and return status."""
         if not cls._pool:
-            raise RuntimeError("Database not initialized. Call Database.initialize() first.")            
+            raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.execute(query, *args)
 

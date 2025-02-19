@@ -22,7 +22,7 @@ services:
   trader-app:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.gpu  # <--- use the GPU Dockerfile
     env_file: .env
     depends_on:
       postgres:
@@ -32,6 +32,15 @@ services:
     volumes:
       - ./model_storage:/app/model_storage
     restart: unless-stopped
+
+    # For Docker Compose GPU support, you can do:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   timescaledb-data:

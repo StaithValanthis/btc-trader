@@ -1,4 +1,5 @@
 # File: app/core/bybit_client.py
+
 import json
 import asyncio
 import websockets
@@ -18,7 +19,7 @@ class BybitMarketData:
         self.max_reconnect_attempts = 5
         self.last_message_time = None
 
-        # Inverse endpoints for BTCUSD
+        # WebSocket endpoints
         if Config.BYBIT_CONFIG['testnet']:
             self.websocket_url = "wss://stream-testnet.bybit.com/v5/public/inverse"
         else:
@@ -34,7 +35,6 @@ class BybitMarketData:
                 ping_timeout=10,
                 extra_headers={"User-Agent": "BTC-Trader/1.0"}
             )
-
             subscription = {
                 "op": "subscribe",
                 "args": [f"publicTrade.{self.symbol}"]
@@ -79,24 +79,37 @@ class BybitMarketData:
 
             try:
                 message = await self.ws.recv()
+                if not self.running:
+                    break
+
                 self.last_message_time = datetime.now(timezone.utc)
                 data = json.loads(message)
 
                 if 'topic' in data and data['topic'] == f"publicTrade.{self.symbol}":
-                    # Insert trade data into DB
                     await self._process_trades(data['data'])
                 else:
                     logger.debug("Received non-trade message", message=data)
 
             except websockets.ConnectionClosed:
                 logger.warning("WebSocket connection closed.")
-                await self._reconnect()
+                if self.running:
+                    await self._reconnect()
             except Exception as e:
+                if not self.running:
+                    break
                 logger.error("Message processing error", error=str(e))
                 await asyncio.sleep(1)
 
     async def _process_trades(self, trade_data):
-        """Insert trades into the market_data table."""
+        """Insert trades into the market_data table, if the DB is still open."""
+        if not self.running:
+            return
+
+        # If the DB is closed, skip inserts
+        if Database._pool is None:
+            logger.warning("Database is closed; skipping trade inserts.")
+            return
+
         if not isinstance(trade_data, list):
             trade_data = [trade_data]
 
@@ -141,6 +154,7 @@ class BybitMarketData:
             asyncio.create_task(self._connection_monitor())
 
     async def stop(self):
+        """Stop WebSocket tasks and prevent future inserts."""
         self.running = False
         if self.ws:
             await self.ws.close()

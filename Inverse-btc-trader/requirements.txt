@@ -5,3 +5,11 @@ structlog==23.3.0
 websockets==12.0
 aiohttp==3.9.3
 pandas==2.2.3
+
+# For LSTM & ML
+numpy==1.24.2
+tensorflow==2.15.0
+scikit-learn==1.2.2
+
+# Technical indicators
+ta==0.10.1
