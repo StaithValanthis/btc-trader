@@ -1,3 +1,5 @@
+# File: app/services/backfill_service.py
+
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -75,7 +77,6 @@ async def backfill_bybit_kline(
                 c_price = float(bar[4])
                 volume  = float(bar[5])
 
-                # Updated query: Remove trade_id column.
                 query = '''
                     INSERT INTO candles (time, open, high, low, close, volume)
                     VALUES ($1, $2, $3, $4, $5, $6)
@@ -99,10 +100,10 @@ async def backfill_bybit_kline(
 
 
 async def maybe_backfill_candles(
-    min_rows=1000,
+    min_rows=2000,        # Require at least 2000 rows in the candles table.
     symbol="BTCUSD",
     interval=1,
-    days_to_fetch=1,
+    days_to_fetch=21,     # Fetch 21 days of data.
     start_time_ms=None
 ):
     """

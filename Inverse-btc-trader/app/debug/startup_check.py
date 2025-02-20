@@ -2,7 +2,8 @@
 
 import asyncio
 from structlog import get_logger
-from app.core import Config, Database
+from app.core.config import Config
+from app.core.database import Database
 from pybit.unified_trading import HTTP
 from app.services.backfill_service import maybe_backfill_candles
 
@@ -20,12 +21,12 @@ class StartupChecker:
         await cls._check_db_connection()
         await cls._check_bybit_connection()
 
-        # Automatically backfill candles if necessary.
+        # Automatically backfill candles if fewer than 2000 rows exist.
         await maybe_backfill_candles(
-            min_rows=1000,
+            min_rows=2000,
             symbol="BTCUSD",
             interval=1,
-            days_to_fetch=2  # Adjust as needed
+            days_to_fetch=21  # Fetch 21 days of 1-min candles (resampling to ~2000 15-min candles)
         )
 
         logger.info("All startup checks passed")

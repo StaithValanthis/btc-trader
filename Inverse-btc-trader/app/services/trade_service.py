@@ -14,13 +14,36 @@ from app.services.backfill_service import maybe_backfill_candles
 
 logger = get_logger(__name__)
 
+def get_market_regime(df, adx_period=14, threshold=25):
+    """
+    Compute the ADX using the high, low, and close values in the DataFrame.
+    Returns "trending" if the latest ADX exceeds the threshold, otherwise "sideways".
+    """
+    try:
+        adx_indicator = ta.trend.ADXIndicator(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=adx_period
+        )
+        adx_series = adx_indicator.adx()
+        if adx_series.empty:
+            return "sideways"
+        latest_adx = adx_series.iloc[-1]
+        logger.info("Market regime ADX", adx=latest_adx)
+        return "trending" if latest_adx > threshold else "sideways"
+    except Exception as e:
+        logger.error("Error computing market regime", error=str(e))
+        return "sideways"
+
 class TradeService:
     def __init__(self):
         # Initialize MLService with your desired lookback (e.g., 60)
         self.ml_service = MLService(lookback=60)
         self.session = None
         self.min_qty = None            # Minimum order quantity (in USD notional)
-        self.current_position = None   # Current trade direction, if any
+        self.current_position = None   # Current trade direction ("buy" or "sell")
+        self.current_order_qty = None  # Order quantity of the open trade
         self.last_trade_time = None
         self.running = False
 
@@ -94,34 +117,69 @@ class TradeService:
             leverage = 20.0 - ((vol_ratio - 0.005) / 0.015) * (20.0 - 1.0)
         return round(leverage, 2)
 
-    def compute_sl_tp(self, current_price: float, atr_value: float, support: float, resistance: float, signal: str, multiplier: float = 2.0):
+    def compute_sl_tp_dynamic(self, current_price: float, atr_value: float, signal: str,
+                              market_regime: str, risk_multiplier=1.5, reward_ratio=3.0):
         """
-        Compute stop loss and take profit levels using a weighted combination of ATR-based
-        and support/resistance–based levels.
+        Compute dynamic stop loss and take profit levels based on ATR, with adjustments
+        based on the market regime.
         
-        For Buy orders:
-          SL = current_price - [0.5*(multiplier*ATR) + 0.5*(current_price - support)]
-          TP = current_price + [0.5*(multiplier*ATR) + 0.5*(resistance - current_price)]
-          
-        For Sell orders:
-          SL = current_price + [0.5*(multiplier*ATR) + 0.5*(resistance - current_price)]
-          TP = current_price - [0.5*(multiplier*ATR) + 0.5*(current_price - support)]
+        In trending markets, we may allow wider SL and a more aggressive TP.
+        In sideways markets, we tighten SL and target a lower reward.
         """
-        atr_component = multiplier * abs(atr_value)
+        if market_regime == "trending":
+            risk = risk_multiplier * abs(atr_value)
+            adjusted_reward_ratio = reward_ratio
+        else:  # sideways
+            risk = (risk_multiplier * 0.8) * abs(atr_value)
+            adjusted_reward_ratio = reward_ratio * 0.8
+        
         if signal.lower() == "buy":
-            stop_loss = current_price - (0.5 * atr_component + 0.5 * (current_price - support))
-            take_profit = current_price + (0.5 * atr_component + 0.5 * (resistance - current_price))
-            if stop_loss >= current_price:
-                stop_loss = current_price - atr_component
-            return stop_loss, take_profit
+            stop_loss = current_price - risk
+            take_profit = current_price + risk * adjusted_reward_ratio
         elif signal.lower() == "sell":
-            stop_loss = current_price + (0.5 * atr_component + 0.5 * (resistance - current_price))
-            take_profit = current_price - (0.5 * atr_component + 0.5 * (current_price - support))
-            if stop_loss <= current_price:
-                stop_loss = current_price + atr_component
-            return stop_loss, take_profit
+            stop_loss = current_price + risk
+            take_profit = current_price - risk * adjusted_reward_ratio
         else:
             return None, None
+        return stop_loss, take_profit
+
+    def compute_trailing_stop(self, current_price: float, atr_value: float, signal: str, trail_multiplier=1.5):
+        """
+        Compute a trailing stop level based on ATR.
+        
+        - trail_multiplier: Multiplies ATR to set the trailing stop distance.
+        """
+        trail_distance = trail_multiplier * abs(atr_value)
+        if signal.lower() == "buy":
+            trailing_stop = current_price - trail_distance
+        elif signal.lower() == "sell":
+            trailing_stop = current_price + trail_distance
+        else:
+            trailing_stop = None
+        return trailing_stop
+
+    async def exit_trade(self):
+        """
+        Exit the currently open trade by placing a market order with the opposite side.
+        This method assumes that executing an order in the opposite direction will close the position.
+        """
+        if self.current_position is None:
+            logger.warning("No current position to exit.")
+            return
+
+        exit_side = "Sell" if self.current_position.lower() == "buy" else "Buy"
+        order_qty = self.current_order_qty if self.current_order_qty is not None else self.min_qty
+
+        logger.info("Exiting trade", exit_side=exit_side, qty=order_qty)
+        await self.execute_trade(
+            side=exit_side,
+            qty=order_qty,
+            stop_loss=None,
+            take_profit=None,
+            leverage=10.0
+        )
+        self.current_position = None
+        self.current_order_qty = None
 
     async def run_trading_logic(self):
         """
@@ -130,19 +188,23 @@ class TradeService:
         1. Fetch recent 1-minute candle data from the 'candles' table.
         2. If fewer than 900 rows are available, trigger backfill.
         3. Ensure the 1-minute data is continuous.
-        4. Resample the 1-minute data to 15-minute candles using .agg() with a custom dictionary.
+        4. Resample the 1-minute data to 15-minute candles.
         5. Forward fill missing values and drop rows missing the 'close' value.
-        6. Log the 1-minute and 15-minute data details (row count and time range).
+        6. Log details of the 1-minute and 15-minute data.
         7. Compute technical indicators (RSI, MACD, Bollinger Bands, ATR) on the 15-minute data.
-        8. Generate an ML prediction signal using the 15-minute data.
-        9. Compute support/resistance from the most recent 15-minute candle.
-        10. Check for open trades on the exchange.
-        11. Use fixed leverage of 10x.
-        12. Compute effective trade value = portfolio_value * 0.02 * 10 (rounded to the nearest dollar)
-             and use this value as the order quantity.
-        13. Compute stop loss and take profit using a weighted combination of ATR and support/resistance.
-        14. Override the exchange default leverage with fixed 10x.
-        15. Execute the trade.
+        8. Determine market regime using ADX.
+        9. Generate an ML prediction signal using the 15-minute data.
+        10. Compute support/resistance from the most recent 15-minute candle.
+        11. Check for open trades using internal state first:
+             - If an internal position exists and it differs from the new signal, exit the current trade.
+             - Otherwise, if an internal position exists and matches the new signal, skip trade entry.
+             - If no internal state, check the exchange.
+        12. Use fixed leverage of 10x.
+        13. Compute effective trade value and order quantity.
+        14. Compute dynamic SL and TP using the ATR-based risk/reward strategy and market regime.
+        15. Compute the initial trailing stop level.
+        16. Override exchange default leverage and execute the trade.
+        17. Store details of the new open trade.
         """
         if not self.running:
             return
@@ -180,7 +242,7 @@ class TradeService:
             # 3. Ensure the 1-minute data is continuous.
             df_1min = df_1min.asfreq('1min')
             
-            # 4. Resample to 15-minute candles using .agg() with a custom dictionary.
+            # 4. Resample to 15-minute candles.
             df_15 = df_1min.resample('15min').agg({
                 'open': 'first',
                 'high': 'max',
@@ -192,7 +254,7 @@ class TradeService:
             # 5. Forward fill missing values and drop rows missing the 'close' value.
             df_15 = df_15.ffill().dropna(subset=["close"])
             
-            # 6. Log details of the 1-minute and 15-minute data.
+            # 6. Log details.
             min_time_1min = df_1min.index.min()
             max_time_1min = df_1min.index.max()
             logger.info(f"1-minute candles count: {len(df_1min)}; Time range: {min_time_1min} to {max_time_1min}")
@@ -227,13 +289,17 @@ class TradeService:
                 logger.warning(f"Not enough 15-minute candle data after dropping NaNs; required >= 14 rows, got {len(df_15)}.")
                 return
 
-            # 8. Generate ML prediction signal using the 15-minute data.
+            # 8. Determine market regime using ADX.
+            market_regime = get_market_regime(df_15)
+            logger.info("Market regime detected", regime=market_regime)
+
+            # 9. Generate ML prediction signal using the 15-minute data.
             signal = self.ml_service.predict_signal(df_15)
             logger.info("15-minute ML prediction", signal=signal)
-            if signal == "Hold":
+            if signal.lower() == "hold":
                 return
 
-            # 9. Compute support/resistance from the most recent 15-minute candle.
+            # 10. Compute support/resistance from the most recent 15-minute candle.
             last_candle = df_15.iloc[-1]
             pivot = (last_candle["high"] + last_candle["low"] + last_candle["close"]) / 3
             resistance = pivot + (last_candle["high"] - pivot)
@@ -248,18 +314,28 @@ class TradeService:
                 logger.info("15-minute price near support; skipping Sell trade.")
                 return
 
-            # 10. Check for open trades.
-            if await self.check_open_trade():
-                logger.info("An open trade exists; skipping new trade.")
-                return
+            # 11. Check for open trades using internal state first.
+            if self.current_position is not None:
+                if self.current_position.lower() != signal.lower():
+                    logger.info("Signal reversal detected (internal state). Exiting current trade before new trade.")
+                    await self.exit_trade()
+                    await asyncio.sleep(1)
+                else:
+                    logger.info("Existing position matches new signal; skipping new trade.")
+                    return
+            else:
+                # If internal state is not set, check the exchange.
+                if await self.check_open_trade():
+                    logger.info("Exchange indicates an open trade but no internal state; skipping new trade.")
+                    return
 
             current_price = last_candle["close"]
 
-            # 11. Use fixed leverage of 10x.
+            # 12. Use fixed leverage of 10x.
             fixed_leverage = 10.0
             logger.info("Using fixed leverage", leverage=fixed_leverage)
 
-            # 12. Compute effective trade value.
+            # 13. Compute effective trade value and order quantity.
             portfolio_value = await self.get_portfolio_value()
             if portfolio_value <= 0:
                 logger.warning("Portfolio value is 0; cannot size position.")
@@ -268,31 +344,26 @@ class TradeService:
             order_qty = effective_trade_value
             order_qty = max(order_qty, self.min_qty)
 
-            # 13. Compute stop loss and take profit using a weighted combination of ATR and support/resistance.
-            multiplier = 2.0
-            if signal.lower() == "buy":
-                stop_loss, take_profit = self.compute_sl_tp(
-                    current_price, df_15["atr"].iloc[-1],
-                    support, resistance, "buy", multiplier)
-                if stop_loss >= current_price:
-                    stop_loss = current_price - (multiplier * abs(df_15["atr"].iloc[-1])) - (0.0001 * current_price)
-            elif signal.lower() == "sell":
-                stop_loss, take_profit = self.compute_sl_tp(
-                    current_price, df_15["atr"].iloc[-1],
-                    support, resistance, "sell", multiplier)
-                if stop_loss <= current_price:
-                    stop_loss = current_price + (multiplier * abs(df_15["atr"].iloc[-1])) + (0.0001 * current_price)
-            else:
-                return
+            # 14. Compute dynamic SL and TP using ATR-based risk/reward strategy and market regime.
+            stop_loss, take_profit = self.compute_sl_tp_dynamic(
+                current_price, df_15["atr"].iloc[-1], signal, market_regime,
+                risk_multiplier=1.5, reward_ratio=3.0
+            )
+            
+            # 15. Compute the initial trailing stop level.
+            trailing_stop = self.compute_trailing_stop(
+                current_price, df_15["atr"].iloc[-1], signal, trail_multiplier=1.5
+            )
+            logger.info("Computed trailing stop", trailing_stop=trailing_stop)
 
             logger.info("Trade parameters computed", current_price=current_price,
                         effective_trade_value=effective_trade_value, order_qty=order_qty,
                         stop_loss=stop_loss, take_profit=take_profit, leverage=fixed_leverage)
 
-            # 14. Override the exchange leverage.
+            # 16. Override the exchange leverage.
             await self.set_trade_leverage(fixed_leverage)
 
-            # 15. Execute the trade.
+            # 17. Execute the trade.
             await self.execute_trade(
                 side=signal,
                 qty=order_qty,
@@ -301,8 +372,10 @@ class TradeService:
                 leverage=fixed_leverage
             )
 
+            # 18. Store details of the new open trade.
             self.last_trade_time = datetime.now(timezone.utc)
             self.current_position = signal.lower()
+            self.current_order_qty = order_qty
 
         except Exception as e:
             logger.error("Error in run_trading_logic", error=str(e))

@@ -10,7 +10,6 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 from structlog import get_logger
-
 import ta  # Used for ATR, RSI, MACD, Bollinger Bands, etc.
 
 # Use the new function name (if needed)
@@ -25,6 +24,7 @@ MODEL_PATH = os.path.join("model_storage", "lstm_model.keras")
 
 # Require 2000 rows for a decent LSTM start (from candles table)
 MIN_TRAINING_ROWS = 2000  
+
 
 class MLService:
     """
@@ -191,7 +191,13 @@ class MLService:
         Predict the trading signal ("Buy" or "Sell") using the trained LSTM.
         Expects recent_data to have at least self.lookback rows and include the following columns:
             close, returns, rsi, macd, macd_signal, macd_diff, bb_high, bb_low, bb_mavg, atr.
+        If the model is not trained yet, returns "Hold".
         """
+        # Guard: Ensure the model is available.
+        if self.model is None:
+            logger.warning("ML model not trained yet; returning 'Hold'.")
+            return "Hold"
+
         # Ensure required features are present; compute if necessary.
         if "returns" not in recent_data.columns and "close" in recent_data.columns:
             recent_data = recent_data.copy()
@@ -233,20 +239,23 @@ class MLService:
                 logger.warning(f"Missing column {col}; cannot predict.")
                 return "Hold"
 
-        # Instead of dropping rows, use only the last `self.lookback` rows and fill any missing values.
+        # Use only the last `self.lookback` rows and fill missing values.
         seq = recent_data[feature_cols].tail(self.lookback).copy()
         seq = seq.ffill().bfill()  # fill forward and backward in case of NaNs
 
+        # If there are still not enough rows, pad the sequence with the first available row.
         if len(seq) < self.lookback:
-            logger.warning("Not enough data for a full sequence after fillna; defaulting to 'Hold'.")
-            return "Hold"
-        
+            missing_count = self.lookback - len(seq)
+            pad = pd.DataFrame([seq.iloc[0].values] * missing_count, columns=seq.columns)
+            seq = pd.concat([pad, seq], ignore_index=True)
+            logger.info("Padded the sequence to meet the required lookback length", 
+                        padded_rows=missing_count, new_length=len(seq))
+
         data_seq = seq.values
         data_seq = np.expand_dims(data_seq, axis=0)  # shape: (1, lookback, num_features)
         logger.info("Predicting signal using data sequence", shape=data_seq.shape)
         pred = self.model.predict(data_seq)
         return "Buy" if pred[0][0] > 0.5 else "Sell"
-
 
     def _build_model(self, input_shape):
         """
