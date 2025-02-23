@@ -22,11 +22,12 @@ class StartupChecker:
         await cls._check_bybit_connection()
 
         # Automatically backfill candles if fewer than 2000 rows exist.
+        # Updated to fetch 365 days of 1-min candles.
         await maybe_backfill_candles(
             min_rows=2000,
             symbol="BTCUSD",
             interval=1,
-            days_to_fetch=21  # Fetch 21 days of 1-min candles (resampling to ~2000 15-min candles)
+            days_to_fetch=180
         )
 
         logger.info("All startup checks passed")

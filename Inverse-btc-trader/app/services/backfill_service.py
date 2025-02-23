@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 async def backfill_bybit_kline(
     symbol="BTCUSD",
     interval=1,
-    days_to_fetch=1,
+    days_to_fetch=365,  # Updated to fetch approximately 12 months of data.
     start_time_ms=None
 ):
     """
@@ -39,7 +39,7 @@ async def backfill_bybit_kline(
         start_time_ms = now_ms - (days_to_fetch * 24 * 60 * 60 * 1000)
 
     total_minutes = days_to_fetch * 24 * 60
-    bars_per_fetch = 200
+    bars_per_fetch = 200  # Bybit returns up to 200 bars per request
     inserted_count = 0
     current_start = start_time_ms
 
@@ -100,10 +100,10 @@ async def backfill_bybit_kline(
 
 
 async def maybe_backfill_candles(
-    min_rows=2000,        # Require at least 2000 rows in the candles table.
+    min_rows=1000,
     symbol="BTCUSD",
     interval=1,
-    days_to_fetch=21,     # Fetch 21 days of data.
+    days_to_fetch=365,  # Updated to fetch 365 days (12 months) of data.
     start_time_ms=None
 ):
     """

@@ -22,7 +22,7 @@ services:
   trader-app:
     build:
       context: .
-      dockerfile: Dockerfile.gpu  # <--- use the GPU Dockerfile
+      dockerfile: Dockerfile  # <--- use the GPU Dockerfile
     env_file: .env
     depends_on:
       postgres:
