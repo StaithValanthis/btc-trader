@@ -19,21 +19,33 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    networks:
+      - trading-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   trader-app:
     build:
       context: .
-      dockerfile: Dockerfile  # <--- use the GPU Dockerfile
+      dockerfile: Dockerfile
     env_file: .env
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - trading-net
     volumes:
       - ./model_storage:/app/model_storage
     restart: unless-stopped
-
-    # For Docker Compose GPU support, you can do:
     deploy:
       resources:
         reservations:

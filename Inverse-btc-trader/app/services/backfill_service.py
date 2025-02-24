@@ -1,4 +1,4 @@
-# File: app/services/backfill_service.py
+# Updated file: app/services/backfill_service.py
 
 import asyncio
 import time
@@ -14,18 +14,11 @@ logger = get_logger(__name__)
 async def backfill_bybit_kline(
     symbol="BTCUSD",
     interval=1,
-    days_to_fetch=365,  # Updated to fetch approximately 12 months of data.
+    days_to_fetch=365,  # Updated to fetch 365 days of data.
     start_time_ms=None
 ):
     """
-    Fetch Bybit inverse Kline (candle) data (OHLC) and insert it into the `candles` table.
-    
-    - symbol: e.g. "BTCUSD" for the inverse contract.
-    - interval: candlestick interval in minutes (e.g., 1, 3, 5, 15, etc.).
-    - days_to_fetch: number of days of historical data to fetch.
-    - start_time_ms: starting UTC timestamp in milliseconds (if None, defaults to days_to_fetch ago).
-    
-    Note: This function assumes that the database pool is already initialized.
+    Fetch Bybit inverse Kline (candle) data and insert it into the `candles` table using a rolling update approach.
     """
     session = HTTP(
         testnet=Config.BYBIT_CONFIG['testnet'],
@@ -33,10 +26,14 @@ async def backfill_bybit_kline(
         api_secret=Config.BYBIT_CONFIG['api_secret']
     )
 
-    # If no start time is provided, default to days_to_fetch ago.
+    # Determine start_time_ms based on the latest candle in the DB if not provided
     if start_time_ms is None:
-        now_ms = int(time.time() * 1000)
-        start_time_ms = now_ms - (days_to_fetch * 24 * 60 * 60 * 1000)
+        latest = await Database.fetchval("SELECT EXTRACT(EPOCH FROM MAX(time)) * 1000 FROM candles")
+        if latest is None:
+            now_ms = int(time.time() * 1000)
+            start_time_ms = now_ms - (days_to_fetch * 24 * 60 * 60 * 1000)
+        else:
+            start_time_ms = int(latest) + 1  # Start just after the latest candle
 
     total_minutes = days_to_fetch * 24 * 60
     bars_per_fetch = 200  # Bybit returns up to 200 bars per request
@@ -45,8 +42,7 @@ async def backfill_bybit_kline(
 
     fetches_needed = (total_minutes // (bars_per_fetch * interval)) + 1
 
-    logger.info(f"Starting candle backfill for {symbol}: interval={interval} minute(s), "
-                f"{days_to_fetch} day(s) starting at {start_time_ms}")
+    logger.info(f"Starting rolling candle backfill for {symbol}: interval={interval} minute(s), {days_to_fetch} day(s) from {start_time_ms}")
 
     for _ in range(fetches_needed):
         resp = await asyncio.to_thread(
@@ -68,7 +64,6 @@ async def backfill_bybit_kline(
 
         for bar in kline_data:
             try:
-                # bar[0] is the open time in milliseconds.
                 bar_time_ms = int(bar[0])
                 dt = datetime.utcfromtimestamp(bar_time_ms / 1000).replace(tzinfo=timezone.utc)
                 o_price = float(bar[1])
@@ -76,7 +71,6 @@ async def backfill_bybit_kline(
                 l_price = float(bar[3])
                 c_price = float(bar[4])
                 volume  = float(bar[5])
-
                 query = '''
                     INSERT INTO candles (time, open, high, low, close, volume)
                     VALUES ($1, $2, $3, $4, $5, $6)
@@ -98,17 +92,15 @@ async def backfill_bybit_kline(
 
     logger.info(f"Bybit candle backfill complete for {symbol}. Inserted {inserted_count} records.")
 
-
 async def maybe_backfill_candles(
     min_rows=1000,
     symbol="BTCUSD",
     interval=1,
-    days_to_fetch=365,  # Updated to fetch 365 days (12 months) of data.
+    days_to_fetch=365,
     start_time_ms=None
 ):
     """
-    Check the `candles` table row count. If fewer than `min_rows` rows exist,
-    automatically backfill historical candles.
+    Check the `candles` table row count. If fewer than `min_rows` rows exist, automatically backfill historical candles.
     """
     await Database.initialize()
     row_count = await Database.fetchval("SELECT COUNT(*) FROM candles")
@@ -124,7 +116,6 @@ async def maybe_backfill_candles(
         )
     else:
         logger.info("Candles table has sufficient data; backfill not required.")
-
 
 if __name__ == "__main__":
     asyncio.run(backfill_bybit_kline())
