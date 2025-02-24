@@ -46,14 +46,7 @@ services:
     volumes:
       - ./model_storage:/app/model_storage
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
+    
 volumes:
   timescaledb-data:
 
