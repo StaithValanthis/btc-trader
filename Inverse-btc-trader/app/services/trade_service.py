@@ -1,15 +1,16 @@
 import warnings
+# Suppress RuntimeWarnings from ta.trend (e.g., division warnings)
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ta.trend")
 
 import asyncio
 import math
-import json
+from pybit.unified_trading import HTTP
+from structlog import get_logger
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import ta
-from datetime import datetime, timezone
-from pybit.unified_trading import HTTP
-from structlog import get_logger
+import json
 
 from app.core import Database, Config
 from app.services.ml_service import MLService
@@ -19,16 +20,12 @@ from app.utils.cache import redis_client
 logger = get_logger(__name__)
 
 def enhanced_get_market_regime(df, adx_period=14, threshold=25):
-    """
-    Example market-regime detection logic. (Unchanged from original code)
-    """
     try:
         df_clean = df[["high", "low", "close"]].ffill().dropna()
         required_rows = adx_period * 2
         if len(df_clean) < required_rows:
             logger.warning("Not enough data for ADX calculation; defaulting regime to sideways")
             return "sideways"
-
         adx_indicator = ta.trend.ADXIndicator(
             high=df_clean["high"],
             low=df_clean["low"],
@@ -69,7 +66,6 @@ def enhanced_get_market_regime(df, adx_period=14, threshold=25):
                 regime = "sideways"
         else:
             regime = "sideways"
-
         logger.info("Enhanced market regime detection",
                     adx=latest_adx,
                     ma_trend=ma_trend,
@@ -81,25 +77,19 @@ def enhanced_get_market_regime(df, adx_period=14, threshold=25):
         logger.error("Error in enhanced market regime detection", error=str(e))
         return "sideways"
 
-
 class TradeService:
     def __init__(self):
         self.ml_service = MLService(lookback=60)
         self.session = None
-        self.min_qty = None
+        self.min_qty = None            # Minimum order quantity (in desired units)
         self.current_position = None   # "buy" or "sell"
         self.current_order_qty = None
         self.last_trade_time = None
         self.running = False
-
-        # NEW: Track fill price & trailing-stop status
-        self.entry_price = None
-        self.trailing_stop_set = False
+        self.trailing_stop = None
+        self.scaled_in = False
 
     async def initialize(self):
-        """
-        Initializes the trade service, sets up Bybit session, gets min_qty, starts ML retrain + trailing-stop tasks.
-        """
         try:
             self.session = HTTP(
                 testnet=Config.BYBIT_CONFIG['testnet'],
@@ -114,33 +104,21 @@ class TradeService:
             logger.critical("Fatal error initializing trade service", error=str(e))
             raise
 
-        # Kick off ML retrain & trailing-stop tasks
         asyncio.create_task(self.ml_service.schedule_daily_retrain())
         asyncio.create_task(self.update_trailing_stop_task())
         self.running = True
 
     async def _get_min_order_qty(self):
-        """
-        Fetch minimum order quantity from Bybit instruments info.
-        """
         if not self.min_qty:
             info = await asyncio.to_thread(
                 self.session.get_instruments_info,
                 category=Config.BYBIT_CONFIG.get('category', 'inverse'),
                 symbol=Config.TRADING_CONFIG['symbol']
             )
-            if info.get("retCode", -1) != 0:
-                logger.error("Failed to fetch instrument info", data=info)
-                raise RuntimeError("Error fetching instrument info from Bybit.")
-
-            # Bybit v5 "inverse" => info['result']['list'][0]['lotSizeFilter']['minOrderQty']
             self.min_qty = float(info['result']['list'][0]['lotSizeFilter']['minOrderQty'])
             logger.info("Loaded min order qty", min_qty=self.min_qty)
 
     async def check_open_trade(self) -> bool:
-        """
-        Returns True if there's an existing open position (size != 0).
-        """
         try:
             pos_data = await asyncio.to_thread(
                 self.session.get_positions,
@@ -160,135 +138,132 @@ class TradeService:
             logger.error("Error checking open trade", error=str(e))
             return False
 
+    def calculate_best_leverage(self, current_price: float, atr_value: float) -> float:
+        vol_ratio = abs(atr_value) / current_price
+        if vol_ratio >= 0.02:
+            leverage = 1.0
+        elif vol_ratio <= 0.005:
+            leverage = 20.0
+        else:
+            leverage = 20.0 - ((vol_ratio - 0.005) / 0.015) * (20.0 - 1.0)
+        return round(leverage, 2)
+
+    def compute_sl_tp_dynamic(self, current_price: float, atr_value: float, signal: str,
+                              market_regime: str, risk_multiplier=1.5, reward_ratio=3.0):
+        if market_regime == "trending":
+            risk = risk_multiplier * abs(atr_value)
+            adjusted_reward_ratio = reward_ratio
+        else:
+            risk = (risk_multiplier * 0.8) * abs(atr_value)
+            adjusted_reward_ratio = reward_ratio * 0.8
+
+        if signal.lower() == "buy":
+            stop_loss = current_price - risk
+            take_profit = current_price + risk * adjusted_reward_ratio
+        elif signal.lower() == "sell":
+            stop_loss = current_price + risk
+            take_profit = current_price - risk * adjusted_reward_ratio
+        else:
+            return None, None
+        return stop_loss, take_profit
+
+    def compute_trailing_stop(self, current_price: float, atr_value: float, signal: str, trail_multiplier=1.5):
+        trail_distance = trail_multiplier * abs(atr_value)
+        min_trail_distance = 0.10 * current_price
+        if trail_distance < min_trail_distance:
+            trail_distance = min_trail_distance
+        if signal.lower() == "buy":
+            return current_price - trail_distance
+        elif signal.lower() == "sell":
+            return current_price + trail_distance
+        return None
+
+    async def set_trailing_stop(self, trailing_stop: float):
+        params = {
+            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
+            "symbol": Config.TRADING_CONFIG['symbol'],
+            "trailingStop": str(trailing_stop),
+            "positionIdx": 0
+        }
+        try:
+            response = await asyncio.to_thread(self.session.set_trading_stop, **params)
+            logger.info("Trailing stop set", data=response)
+        except Exception as e:
+            logger.error("Error setting trailing stop", error=str(e))
+
+    async def update_trailing_stop_task(self):
+        while self.running:
+            if self.current_position is not None and self.trailing_stop is not None:
+                try:
+                    await self.set_trailing_stop(self.trailing_stop)
+                    logger.info("Updated trailing stop", trailing_stop=self.trailing_stop)
+                except Exception as ex:
+                    logger.error("Error updating trailing stop", error=str(ex))
+            await asyncio.sleep(60)
+
     async def exit_trade(self):
-        """
-        Closes any current position by taking the opposite side in the same quantity.
-        """
         if self.current_position is None:
             logger.warning("No current position to exit.")
             return
-
         exit_side = "Sell" if self.current_position.lower() == "buy" else "Buy"
         order_qty = self.current_order_qty if self.current_order_qty is not None else self.min_qty
         logger.info("Exiting trade", exit_side=exit_side, qty=order_qty)
-
         await self.execute_trade(
             side=exit_side,
             qty=str(order_qty),
             stop_loss=None,
             take_profit=None,
-            leverage="5",       # or whatever you prefer
+            leverage="5",
             trailing_stop=None
         )
-
-        # Reset internal state
         self.current_position = None
         self.current_order_qty = None
-        self.entry_price = None
-        self.trailing_stop_set = False
+        self.scaled_in = False
+
+    async def scale_in_trade(self, side: str, additional_qty: int, delay: int = 60):
+        await asyncio.sleep(delay)
+        recent_df = await self.get_recent_candles()
+        new_signal = self.ml_service.predict_signal(recent_df)
+        if new_signal.lower() == side.lower():
+            logger.info("Scaling in additional position", side=side, additional_qty=additional_qty)
+            await self.execute_trade(
+                side=side,
+                qty=str(additional_qty),
+                stop_loss=None,
+                take_profit=None,
+                leverage="5",
+                trailing_stop=None
+            )
+            self.scaled_in = True
+        else:
+            logger.info("Market conditions not favorable for scaling in")
+
+    async def get_recent_candles(self):
+        cached = redis_client.get("recent_candles")
+        if cached:
+            data = json.loads(cached)
+            df = pd.DataFrame(data)
+            df['time'] = pd.to_datetime(df['time'])
+            df.set_index('time', inplace=True)
+            return df
+        else:
+            rows = await Database.fetch("""
+                SELECT time, open, high, low, close, volume
+                FROM candles
+                ORDER BY time DESC
+                LIMIT 1800
+            """)
+            df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+            if not df.empty:
+                df['time'] = pd.to_datetime(df['time'])
+                df.sort_values("time", inplace=True)
+                df.set_index("time", inplace=True)
+            return df
 
     async def run_trading_logic(self):
-        """
-        Main method to be called periodically (e.g. every minute).
-        1) Gathers recent candle data
-        2) ML prediction
-        3) If new trade signal, compute 3x portfolio - 1, place new trade
-        4) If existing position conflicts with new signal, exit
-        """
         if not self.running:
             return
 
-        # Pull recent 1-min candles from cache or DB
-        df_1min = await self._get_recent_1min_candles()
-        if df_1min is None or len(df_1min) < 60:
-            logger.warning("Not enough 1-minute candle data for prediction yet.")
-            return
-
-        # Convert to 15-min for ML
-        df_15 = df_1min.resample('15min').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).ffill().dropna()
-        if len(df_15) < 14:
-            logger.warning("Not enough 15-minute candle data for ML prediction.")
-            return
-
-        # Optionally detect regime (not strictly required for your trailing stop)
-        market_regime = enhanced_get_market_regime(df_15)
-        logger.info("Market regime detected", regime=market_regime)
-
-        # Predict signal via ML
-        signal = self.ml_service.predict_signal(df_15)
-        logger.info("15-minute ML prediction", signal=signal)
-        if signal.lower() not in ["buy", "sell"]:
-            return
-
-        # Pivot/resistance check (unchanged from your code)
-        last_candle = df_15.iloc[-1]
-        pivot = (last_candle["high"] + last_candle["low"] + last_candle["close"]) / 3
-        resistance_threshold = last_candle["close"] * 1.01
-        support_threshold = last_candle["close"] * 0.99
-        if signal.lower() == "buy" and last_candle["close"] > resistance_threshold:
-            logger.info("15-minute price near resistance; skipping Buy trade.")
-            return
-        if signal.lower() == "sell" and last_candle["close"] < support_threshold:
-            logger.info("15-minute price near support; skipping Sell trade.")
-            return
-
-        # Handle existing positions
-        if await self.check_open_trade():
-            # If we do have an open position but the new signal is opposite, exit first
-            if self.current_position and self.current_position.lower() != signal.lower():
-                logger.info("Signal reversal detected. Exiting current trade before new trade.")
-                await self.exit_trade()
-                await asyncio.sleep(1)
-            else:
-                logger.info("Existing position matches new signal; skipping new trade.")
-                return
-        else:
-            # No open position found at the exchange
-            self.current_position = None
-            self.current_order_qty = None
-
-        # ============ New position sizing: 3x portfolio - 1 ============
-        portfolio_value = await self.get_portfolio_value()
-        if portfolio_value <= 0:
-            logger.warning("Portfolio value is 0; cannot size position.")
-            return
-
-        raw_amount = 3 * portfolio_value
-        entry_value = round(raw_amount) - 1  # nearest dollar, then minus 1
-        if entry_value < 1:
-            logger.warning(f"Calculated entry_value is too small: {entry_value}")
-            return
-
-        # Example: Set a fixed leverage if you like
-        leverage = 5
-        await self.set_trade_leverage(leverage)
-
-        # Execute the trade (no trailing stop, no SL/TP yet)
-        await self.execute_trade(
-            side=signal,
-            qty=str(entry_value),
-            stop_loss=None,
-            take_profit=None,
-            leverage=str(leverage),
-            trailing_stop=None
-        )
-
-        # Record internal state
-        self.last_trade_time = datetime.now(timezone.utc)
-        self.current_position = signal.lower()
-        self.current_order_qty = entry_value
-        self.trailing_stop_set = False  # Will be set by update_trailing_stop_task once +5%
-
-    async def _get_recent_1min_candles(self):
-        """
-        Pulls 1-min candles from Redis if cached, else from the DB, up to ~1800 bars.
-        """
         cached = redis_client.get("recent_candles")
         if cached:
             data = json.loads(cached)
@@ -303,154 +278,137 @@ class TradeService:
                 ORDER BY time DESC
                 LIMIT 1800
             """)
-            if not rows:
-                return None
+            if not rows or len(rows) < 60:
+                logger.warning("Not enough 1-minute candle data for prediction yet.")
+                return
             df_1min = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
             df_1min['time'] = pd.to_datetime(df_1min['time'])
             df_1min.sort_values("time", inplace=True)
             df_1min.set_index("time", inplace=True)
             redis_client.setex("recent_candles", 60, df_1min.reset_index().to_json(orient="records"))
-
-        df_1min = df_1min.asfreq("1min")
-        return df_1min
-
-    async def update_trailing_stop_task(self):
-        """
-        Runs periodically to check if position is +5% in profit.
-        If so, sets a 3% trailing stop once (for either a long or short).
-        """
-        while self.running:
-            try:
-                if (
-                    self.current_position
-                    and not self.trailing_stop_set
-                    and self.entry_price
-                ):
-                    current_price = await self._fetch_current_price()
-                    if self.current_position == "buy":
-                        # +5% => current_price >= entry_price * 1.05
-                        if current_price >= self.entry_price * 1.05:
-                            # trailing offset = 3% of current price
-                            offset = round(current_price * 0.03, 2)
-                            await self.set_trailing_stop(offset)
-                            self.trailing_stop_set = True
-                    elif self.current_position == "sell":
-                        # +5% (for a short) => current_price <= entry_price * 0.95
-                        if current_price <= self.entry_price * 0.95:
-                            offset = round(current_price * 0.03, 2)
-                            await self.set_trailing_stop(offset)
-                            self.trailing_stop_set = True
-
-            except Exception as ex:
-                logger.error("update_trailing_stop_task error", error=str(ex))
-
-            await asyncio.sleep(60)  # adjust as needed
-
-    async def set_trailing_stop(self, offset: float):
-        """
-        Bybit v5 Inverse trailingStop is an absolute offset in USD.
-        We set 'trailingStop' param to e.g. '100' => 100 USD behind market.
-        """
-        params = {
-            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-            "symbol": Config.TRADING_CONFIG['symbol'],
-            "trailingStop": str(offset),
-            "positionIdx": 0
-        }
-        try:
-            response = await asyncio.to_thread(self.session.set_trading_stop, **params)
-            logger.info("Trailing stop set", data=response)
-        except Exception as e:
-            logger.error("Error setting trailing stop", error=str(e))
-
-    async def execute_trade(self, side: str, qty: str,
-                            stop_loss: float = None, take_profit: float = None,
-                            leverage: str = None, trailing_stop: float = None):
-        """
-        Places a Market order. We parse the fill price & store in self.entry_price.
-        """
-        if not self.running:
+        
+        df_1min = df_1min.asfreq('1min')
+        df_15 = df_1min.resample('15min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).ffill().dropna()
+        
+        if len(df_15) < 14:
+            logger.warning("Not enough 15-minute candle data for ML prediction.")
             return
-        if float(qty) < self.min_qty:
-            logger.error("Position size below minimum", required=self.min_qty, actual=qty)
+        
+        df_15["returns"] = df_15["close"].pct_change()
+        df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
+        macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
+        df_15["macd"] = macd.macd()
+        df_15["macd_signal"] = macd.macd_signal()
+        df_15["macd_diff"] = macd.macd_diff()
+        boll = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
+        df_15["bb_high"] = boll.bollinger_hband()
+        df_15["bb_low"] = boll.bollinger_lband()
+        df_15["bb_mavg"] = boll.bollinger_mavg()
+        atr_indicator = ta.volatility.AverageTrueRange(
+            high=df_15["high"],
+            low=df_15["low"],
+            close=df_15["close"],
+            window=14
+        )
+        df_15["atr"] = atr_indicator.average_true_range()
+        df_15.dropna(subset=["close", "atr", "rsi"], inplace=True)
+        if len(df_15) < 14:
+            logger.warning("Not enough 15-minute candle data after cleaning.")
             return
-
-        logger.info("Placing trade",
-                    side=side,
-                    size=qty,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    leverage=leverage,
-                    trailing_stop=trailing_stop)
-
-        order_params = {
-            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-            "symbol": Config.TRADING_CONFIG['symbol'],
-            "side": side,
-            "orderType": "Market",
-            "qty": qty,
-        }
-        if leverage:
-            order_params["leverage"] = leverage
-
-        try:
-            response = await asyncio.to_thread(self.session.place_order, **order_params)
-            if response['retCode'] == 0:
-                logger.info("Trade executed successfully", order_id=response['result']['orderId'])
-
-                # Attempt to parse fill price from response
-                fill_price = None
-                try:
-                    # Bybit typically puts fill info in response['result']['list']
-                    fill_price = float(response['result']['list'][0]['execPrice'])
-                except Exception:
-                    pass
-
-                if fill_price:
-                    self.entry_price = fill_price
-                    logger.info("Recorded entry price", entry_price=fill_price)
-                else:
-                    logger.warning("Could not parse fill_price from Bybit response")
-                    self.entry_price = None
-
-                # Log the trade in DB
-                await self._log_trade(side, qty)
+        
+        market_regime = enhanced_get_market_regime(df_15)
+        logger.info("Market regime detected", regime=market_regime)
+        
+        signal = self.ml_service.predict_signal(df_15)
+        logger.info("15-minute ML prediction", signal=signal)
+        if signal.lower() == "hold":
+            return
+        
+        last_candle = df_15.iloc[-1]
+        pivot = (last_candle["high"] + last_candle["low"] + last_candle["close"]) / 3
+        resistance = pivot + (last_candle["high"] - pivot)
+        support = pivot - (pivot - last_candle["low"])
+        buffer_pct = 0.01
+        resistance_threshold = last_candle["close"] * (1 + buffer_pct)
+        support_threshold = last_candle["close"] * (1 - buffer_pct)
+        if signal.lower() == "buy" and last_candle["close"] > resistance_threshold:
+            logger.info("15-minute price near resistance; skipping Buy trade.")
+            return
+        if signal.lower() == "sell" and last_candle["close"] < support_threshold:
+            logger.info("15-minute price near support; skipping Sell trade.")
+            return
+        
+        if await self.check_open_trade():
+            if self.current_position is not None and self.current_position.lower() != signal.lower():
+                logger.info("Signal reversal detected. Exiting current trade before new trade.")
+                await self.exit_trade()
+                await asyncio.sleep(1)
             else:
-                error_msg = response.get('retMsg', 'Unknown error')
-                logger.error("Trade failed", error=error_msg)
-                # Reset if order fails
-                self.current_position = None
-                self.current_order_qty = None
-                self.entry_price = None
-                self.trailing_stop_set = False
-
-        except Exception as e:
-            logger.error("Trade execution error", error=str(e))
+                logger.info("Existing position matches new signal; skipping new trade.")
+                return
+        else:
             self.current_position = None
             self.current_order_qty = None
-            self.entry_price = None
-            self.trailing_stop_set = False
-
-    async def _fetch_current_price(self) -> float:
-        """
-        Fetches latest price from Bybit's instruments info. 
-        Or you could query your own market_data table.
-        """
-        resp = await asyncio.to_thread(
-            self.session.get_instruments_info,
-            category=Config.BYBIT_CONFIG.get('category', 'inverse'),
-            symbol=Config.TRADING_CONFIG['symbol']
+        
+        current_price = df_1min.iloc[-1]["close"]
+        fixed_leverage = 5  # Updated leverage set to 5
+        fixed_leverage = int(fixed_leverage)
+        logger.info("Using fixed leverage", leverage=fixed_leverage)
+        
+        portfolio_value = await self.get_portfolio_value()
+        if portfolio_value <= 0:
+            logger.warning("Portfolio value is 0; cannot size position.")
+            return
+        
+        effective_trade_value = math.floor(portfolio_value * fixed_leverage)
+        initial_order_qty = int(effective_trade_value * 0.5)
+        remaining_order_qty = effective_trade_value - initial_order_qty
+        
+        stop_loss, take_profit = self.compute_sl_tp_dynamic(
+            current_price, df_15["atr"].iloc[-1], signal, market_regime,
+            risk_multiplier=1.5, reward_ratio=3.0
         )
-        last_price = float(resp['result']['list'][0]['lastPrice'])
-        return last_price
-
+        trailing_stop = self.compute_trailing_stop(
+            current_price, df_15["atr"].iloc[-1], signal, trail_multiplier=1.5
+        )
+        logger.info("Computed trailing stop", trailing_stop=trailing_stop)
+        
+        logger.info("Trade parameters computed", current_price=current_price,
+                    effective_trade_value=effective_trade_value,
+                    initial_order_qty=initial_order_qty,
+                    stop_loss=stop_loss, take_profit=take_profit,
+                    leverage=fixed_leverage)
+        
+        await self.set_trade_leverage(fixed_leverage)
+        await self.execute_trade(
+            side=signal,
+            qty=str(initial_order_qty),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            leverage=str(fixed_leverage),
+            trailing_stop=None
+        )
+        await self.set_trailing_stop(trailing_stop)
+        
+        self.last_trade_time = datetime.now(timezone.utc)
+        self.current_position = signal.lower()
+        self.current_order_qty = initial_order_qty
+        self.scaled_in = False
+        
+        if not self.scaled_in:
+            asyncio.create_task(self.scale_in_trade(signal, remaining_order_qty, delay=60))
+        
     async def set_trade_leverage(self, leverage: int):
-        """
-        Set leverage if category != 'inverse' or if your inverse contract supports it.
-        """
+        # For inverse contracts, leverage setting is not required; skip if category is "inverse"
         if Config.BYBIT_CONFIG.get("category", "inverse") == "inverse":
-            # Bybit inverse might not strictly require set_leverage, but we show it here.
-            logger.info("Setting leverage on inverse (if supported)", leverage=leverage)
+            logger.info("Skipping set_leverage for inverse contracts")
+            return
         try:
             response = await asyncio.to_thread(
                 self.session.set_leverage,
@@ -461,12 +419,46 @@ class TradeService:
             logger.info("Set leverage response", data=response)
         except Exception as e:
             logger.error("Error setting leverage", error=str(e))
+    
+    async def execute_trade(self, side: str, qty: str,
+                              stop_loss: float = None, take_profit: float = None,
+                              leverage: str = None, trailing_stop: float = None):
+        if not self.running:
+            return
+        if float(qty) < self.min_qty:
+            logger.error("Position size below minimum", required=self.min_qty, actual=qty)
+            return
+        logger.info("Placing trade",
+                    side=side,
+                    size=qty,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    leverage=leverage,
+                    trailing_stop=trailing_stop)
+        order_params = {
+            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
+            "symbol": Config.TRADING_CONFIG['symbol'],
+            "side": side,
+            "orderType": "Market",
+            "qty": qty,
+            "stopLoss": str(stop_loss) if stop_loss is not None else None,
+            "takeProfit": str(take_profit) if take_profit is not None else None,
+            "leverage": leverage if leverage is not None else None
+        }
+        order_params = {k: v for k, v in order_params.items() if v is not None}
+        try:
+            response = await asyncio.to_thread(self.session.place_order, **order_params)
+            if response['retCode'] == 0:
+                await self._log_trade(side, qty)
+                logger.info("Trade executed successfully", order_id=response['result']['orderId'])
+            else:
+                error_msg = response.get('retMsg', 'Unknown error')
+                logger.error("Trade failed", error=error_msg)
+        except Exception as e:
+            logger.error("Trade execution error", error=str(e))
+            self.current_position = None
 
     async def get_portfolio_value(self) -> float:
-        """
-        Fetch wallet balances. Sum up USD value of relevant coins. 
-        For an inverse BTCUSD scenario, we often check the BTC coin's 'usdValue'.
-        """
         try:
             balance_data = await asyncio.to_thread(
                 self.session.get_wallet_balance,
@@ -488,9 +480,6 @@ class TradeService:
             return 0.0
 
     async def _log_trade(self, side: str, qty: str):
-        """
-        Simple DB logger for executed trades.
-        """
         if Database._pool is None:
             logger.warning("Database is closed; skipping trade logging.")
             return
