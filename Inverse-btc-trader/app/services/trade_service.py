@@ -1,3 +1,5 @@
+# Updated file: app/services/trade_service.py
+
 import warnings
 # Suppress RuntimeWarnings from ta.trend (e.g., division warnings)
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ta.trend")
@@ -56,15 +58,18 @@ def enhanced_get_market_regime(df, adx_period=14, threshold=25):
         bb_width = boll.bollinger_wband()
         bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0
 
-        if latest_adx > threshold and (
-            (ma_trend == "up" and df_clean['close'].iloc[-1] > df_clean['SMA20'].iloc[-1]) or
-            (ma_trend == "down" and df_clean['close'].iloc[-1] < df_clean['SMA20'].iloc[-1])
-        ):
-            if atr_percentile > 0.5 and bb_width_percentile > 0.5:
-                regime = "trending"
+        # Determine base regime based on ADX and SMA crossovers
+        if latest_adx > threshold:
+            if ma_trend == "up" and df_clean['close'].iloc[-1] > df_clean['SMA20'].iloc[-1]:
+                regime = "uptrending"
+            elif ma_trend == "down" and df_clean['close'].iloc[-1] < df_clean['SMA20'].iloc[-1]:
+                regime = "downtrending"
             else:
                 regime = "sideways"
         else:
+            regime = "sideways"
+        # Further refine: if ATR and Bollinger width percentiles are low, consider regime sideways
+        if regime != "sideways" and (atr_percentile <= 0.5 or bb_width_percentile <= 0.5):
             regime = "sideways"
         logger.info("Enhanced market regime detection",
                     adx=latest_adx,
@@ -86,7 +91,6 @@ class TradeService:
         self.current_order_qty = None
         self.last_trade_time = None
         self.running = False
-        self.trailing_stop = None
         self.scaled_in = False
 
     async def initialize(self):
@@ -105,8 +109,6 @@ class TradeService:
             raise
 
         asyncio.create_task(self.ml_service.schedule_daily_retrain())
-        asyncio.create_task(self.update_trailing_stop_task())
-        # Start continuous update for open trade stops.
         asyncio.create_task(self.update_open_trade_stops_task())
         self.running = True
 
@@ -237,37 +239,12 @@ class TradeService:
             return None, None
         return stop_loss, take_profit
 
-    def compute_trailing_stop(self, current_price: float, atr_value: float, signal: str, trail_multiplier=1.5):
-        computed_distance = trail_multiplier * abs(atr_value)
-        min_trail_distance = 0.10 * current_price
-        # Ensure trailing distance meets the minimum plus a small offset (+1)
-        trailing_distance = max(computed_distance, min_trail_distance) + 1  
-        if signal.lower() == "buy":
-            return current_price - trailing_distance
-        elif signal.lower() == "sell":
-            return current_price + trailing_distance
-        return None
-
-    async def set_trailing_stop(self, trailing_stop: float):
-        params = {
-            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-            "symbol": Config.TRADING_CONFIG['symbol'],
-            "trailingStop": str(trailing_stop),
-            "positionIdx": 0
-        }
-        try:
-            response = await asyncio.to_thread(self.session.set_trading_stop, **params)
-            logger.info("Trailing stop set", data=response)
-        except Exception as e:
-            logger.error("Error setting trailing stop", error=str(e))
-
-    async def update_trade_stops(self, stop_loss: float, take_profit: float, trailing_stop: float):
+    async def update_trade_stops(self, stop_loss: float, take_profit: float):
         params = {
             "category": Config.BYBIT_CONFIG.get("category", "inverse"),
             "symbol": Config.TRADING_CONFIG['symbol'],
             "stopLoss": str(stop_loss),
             "takeProfit": str(take_profit),
-            "trailingStop": str(trailing_stop),
             "positionIdx": 0
         }
         try:
@@ -275,16 +252,6 @@ class TradeService:
             logger.info("Trade stops updated", data=response)
         except Exception as e:
             logger.error("Error updating trade stops", error=str(e))
-
-    async def update_trailing_stop_task(self):
-        while self.running:
-            if self.current_position is not None and self.trailing_stop is not None:
-                try:
-                    await self.set_trailing_stop(self.trailing_stop)
-                    logger.info("Updated trailing stop", trailing_stop=self.trailing_stop)
-                except Exception as ex:
-                    logger.error("Error updating trailing stop", error=str(ex))
-            await asyncio.sleep(60)
 
     async def update_open_trade_stops_task(self):
         while self.running:
@@ -334,11 +301,8 @@ class TradeService:
                     stop_loss, take_profit = self.compute_sl_tp_dynamic(
                         current_price, df_15["atr"].iloc[-1], self.current_position, market_regime, features, base_risk_multiplier=1.5
                     )
-                    trailing_stop = self.compute_trailing_stop(
-                        current_price, df_15["atr"].iloc[-1], self.current_position, trail_multiplier=1.5
-                    )
-                    await self.update_trade_stops(stop_loss, take_profit, trailing_stop)
-                    logger.info("Updated open trade stops", stop_loss=stop_loss, take_profit=take_profit, trailing_stop=trailing_stop)
+                    await self.update_trade_stops(stop_loss, take_profit)
+                    logger.info("Updated open trade stops", stop_loss=stop_loss, take_profit=take_profit)
                 except Exception as e:
                     logger.error("Error updating open trade stops", error=str(e))
             await asyncio.sleep(60)
@@ -355,8 +319,7 @@ class TradeService:
             qty=str(order_qty),
             stop_loss=None,
             take_profit=None,
-            leverage="3",
-            trailing_stop=None
+            leverage="3"
         )
         self.current_position = None
         self.current_order_qty = None
@@ -373,8 +336,7 @@ class TradeService:
                 qty=str(additional_qty),
                 stop_loss=None,
                 take_profit=None,
-                leverage="3",
-                trailing_stop=None
+                leverage="3"
             )
             self.scaled_in = True
         else:
@@ -536,6 +498,19 @@ class TradeService:
         market_regime = enhanced_get_market_regime(df_15)
         logger.info("Market regime detected", regime=market_regime)
 
+        # --- NEW PRE-TRADE CHECKS BASED ON MARKET REGIME ---
+        if (df_15.iloc[-1]["close"] > df_15["close"].mean() and 
+            self.ml_service.predict_signal(df_15).lower() == "buy" and 
+            market_regime == "downtrending"):
+            logger.info("Market is in a downtrend. Skipping Buy trade.")
+            return
+        if (df_15.iloc[-1]["close"] < df_15["close"].mean() and 
+            self.ml_service.predict_signal(df_15).lower() == "sell" and 
+            market_regime == "uptrending"):
+            logger.info("Market is in an uptrend. Skipping Sell trade.")
+            return
+        # -------------------------------------------------------
+
         signal = self.ml_service.predict_signal(df_15)
         logger.info("15-minute ML prediction", signal=signal)
         if signal.lower() == "hold":
@@ -591,10 +566,6 @@ class TradeService:
         stop_loss, take_profit = self.compute_sl_tp_dynamic(
             current_price, df_15["atr"].iloc[-1], signal, market_regime, features, base_risk_multiplier=1.5
         )
-        trailing_stop = self.compute_trailing_stop(
-            current_price, df_15["atr"].iloc[-1], signal, trail_multiplier=1.5
-        )
-        logger.info("Computed trailing stop", trailing_stop=trailing_stop)
         logger.info("Trade parameters computed", current_price=current_price,
                     effective_trade_value=effective_trade_value,
                     order_qty=order_qty,
@@ -607,10 +578,8 @@ class TradeService:
             qty=str(order_qty),
             stop_loss=stop_loss,
             take_profit=take_profit,
-            leverage=str(fixed_leverage),
-            trailing_stop=None
+            leverage=str(fixed_leverage)
         )
-        await self.set_trailing_stop(trailing_stop)
 
         self.last_trade_time = datetime.now(timezone.utc)
         self.current_position = signal.lower()
@@ -618,7 +587,7 @@ class TradeService:
 
     async def execute_trade(self, side: str, qty: str,
                               stop_loss: float = None, take_profit: float = None,
-                              leverage: str = None, trailing_stop: float = None):
+                              leverage: str = None):
         if not self.running:
             return
         if float(qty) < self.min_qty:
@@ -629,8 +598,7 @@ class TradeService:
                     size=qty,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
-                    leverage=leverage,
-                    trailing_stop=trailing_stop)
+                    leverage=leverage)
         order_params = {
             "category": Config.BYBIT_CONFIG.get("category", "inverse"),
             "symbol": Config.TRADING_CONFIG['symbol'],

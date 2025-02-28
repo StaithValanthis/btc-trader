@@ -25,6 +25,7 @@ MODEL_PATH = os.path.join("model_storage", "lstm_model.keras")
 MIN_TRAINING_ROWS = 2000  # This minimum is for 1-min candles; after aggregation, adjust if needed.
 
 # Get the labeling epsilon threshold from environment (default: 0.0005)
+# TODO: Consider making this threshold dynamic based on current volatility
 LABEL_EPSILON = float(os.getenv("LABEL_EPSILON", "0.0005"))
 
 # Custom Attention Layer
