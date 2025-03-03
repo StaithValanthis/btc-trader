@@ -1,10 +1,12 @@
 # File: app/core/bybit_client.py
 
-import json
 import asyncio
+import contextlib
+import json
 import websockets
-from structlog import get_logger
 from datetime import datetime, timezone
+from structlog import get_logger
+
 from app.core.database import Database
 from app.core.config import Config
 
@@ -19,15 +21,67 @@ class BybitMarketData:
         self.max_reconnect_attempts = 5
         self.last_message_time = None
 
-        # New: Lock for recv() and a message queue.
+        # Lock for exclusive ws.recv()
         self.recv_lock = asyncio.Lock()
+
+        # Message queue for processing
         self.message_queue = asyncio.Queue()
 
-        # WebSocket endpoints based on testnet setting.
+        # Construct correct WebSocket endpoint
         if Config.BYBIT_CONFIG['testnet']:
             self.websocket_url = "wss://stream-testnet.bybit.com/v5/public/inverse"
         else:
             self.websocket_url = "wss://stream.bybit.com/v5/public/inverse"
+
+        # Track tasks so we can clean up
+        self._listener_task = None
+        self._process_task = None
+        self._monitor_task = None
+
+    async def run(self):
+        """Start the market data feed by connecting and launching tasks."""
+        self.running = True
+        await self._connect_websocket()
+        if self.running and self.ws:
+            # Create our tasks only if connection succeeded
+            self._listener_task = asyncio.create_task(self._listener(), name="BybitListener")
+            self._process_task = asyncio.create_task(self._process_messages(), name="BybitProcessMsg")
+            self._monitor_task = asyncio.create_task(self._connection_monitor(), name="BybitConnMon")
+
+    async def stop(self):
+        """Stop WebSocket tasks and prevent future inserts."""
+        self.running = False
+
+        # Cancel the listener
+        if self._listener_task:
+            self._listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._listener_task
+            self._listener_task = None
+
+        # Cancel the message processor
+        if self._process_task:
+            self._process_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._process_task
+            self._process_task = None
+
+        # Cancel the connection monitor
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._monitor_task
+            self._monitor_task = None
+
+        # Close the websocket if open
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                logger.warning("Error closing websocket", error=str(e))
+            self.ws = None
+
+        logger.info("Market data service stopped")
 
     async def _connect_websocket(self):
         """Establish a websocket connection and subscribe."""
@@ -54,23 +108,44 @@ class BybitMarketData:
 
     async def _reconnect(self):
         """Attempt to reconnect with exponential backoff."""
+        # Cleanly close old websocket if any
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                logger.warning("Error closing old websocket", error=str(e))
+            self.ws = None
+
+        # Cancel the old listener task if any
+        if self._listener_task:
+            self._listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._listener_task
+            self._listener_task = None
+
+        if not self.running:
+            return  # do not reconnect if we've been stopped
+
         if self.reconnect_attempts < self.max_reconnect_attempts:
             self.reconnect_attempts += 1
             wait_time = min(30, 2 ** self.reconnect_attempts)
             logger.warning("Reconnecting attempt", attempt=self.reconnect_attempts, wait_time=wait_time)
             await asyncio.sleep(wait_time)
+
             await self._connect_websocket()
+            if self.ws and self.running:
+                # Start a new listener task
+                self._listener_task = asyncio.create_task(self._listener(), name="BybitListener")
         else:
             logger.error("Max reconnect attempts reached. Stopping MarketData.")
             self.running = False
 
     async def _listener(self):
         """
-        Listener coroutine that continuously receives messages from the WebSocket.
-        Uses a lock to ensure only one coroutine calls recv() at a time,
-        then puts the message into a queue.
+        Continuously receives messages from the WebSocket in a loop,
+        protected by recv_lock to avoid concurrency conflicts.
         """
-        while self.running:
+        while self.running and self.ws:
             async with self.recv_lock:
                 try:
                     message = await self.ws.recv()
@@ -81,8 +156,7 @@ class BybitMarketData:
 
     async def _process_messages(self):
         """
-        Process messages from the message queue.
-        Decodes JSON messages and dispatches trade data to the _process_trades method.
+        Process messages from the queue (no direct ws.recv() calls here).
         """
         while self.running:
             message = await self.message_queue.get()
@@ -100,13 +174,11 @@ class BybitMarketData:
 
     async def _process_trades(self, trade_data):
         """Insert trades into the market_data table, if the DB is open."""
-        if not self.running:
-            return
-        if Database._pool is None:
-            logger.warning("Database is closed; skipping trade inserts.")
+        if not self.running or Database._pool is None:
             return
         if not isinstance(trade_data, list):
             trade_data = [trade_data]
+
         inserted_count = 0
         for trade in trade_data:
             trade_id = trade['i']
@@ -121,6 +193,7 @@ class BybitMarketData:
                     inserted_count += 1
             except Exception as e:
                 logger.error("Failed to insert trade", error=str(e), trade_id=trade_id)
+
         if inserted_count > 0:
             logger.debug("Inserted new trades", count=inserted_count)
 
@@ -133,20 +206,3 @@ class BybitMarketData:
                     logger.warning("No trade messages in 60s, reconnecting...")
                     await self._reconnect()
             await asyncio.sleep(10)
-
-    async def run(self):
-        """Start the market data feed by connecting and launching listener and monitor tasks."""
-        self.running = True
-        await self._connect_websocket()
-        if self.running:
-            asyncio.create_task(self._listener())
-            asyncio.create_task(self._process_messages())
-            asyncio.create_task(self._connection_monitor())
-
-    async def stop(self):
-        """Stop WebSocket tasks and prevent future inserts."""
-        self.running = False
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
-        logger.info("Market data service stopped")
