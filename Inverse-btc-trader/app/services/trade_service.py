@@ -58,7 +58,6 @@ def enhanced_get_market_regime(df, adx_period=14, threshold=25):
         bb_width = boll.bollinger_wband()
         bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0
 
-        # Determine base regime based on ADX and SMA crossovers
         if latest_adx > threshold:
             if ma_trend == "up" and df_clean['close'].iloc[-1] > df_clean['SMA20'].iloc[-1]:
                 regime = "uptrending"
@@ -68,7 +67,6 @@ def enhanced_get_market_regime(df, adx_period=14, threshold=25):
                 regime = "sideways"
         else:
             regime = "sideways"
-        # Further refine: if ATR and Bollinger width percentiles are low, consider regime sideways
         if regime != "sideways" and (atr_percentile <= 0.5 or bb_width_percentile <= 0.5):
             regime = "sideways"
         logger.info("Enhanced market regime detection",
@@ -86,7 +84,7 @@ class TradeService:
     def __init__(self):
         self.ml_service = MLService(lookback=60)
         self.session = None
-        self.min_qty = None            # Minimum order quantity (in desired units)
+        self.min_qty = None            # Minimum order quantity (in dollars)
         self.current_position = None   # "buy" or "sell"
         self.current_order_qty = None
         self.last_trade_time = None
@@ -119,6 +117,7 @@ class TradeService:
                 category=Config.BYBIT_CONFIG.get('category', 'inverse'),
                 symbol=Config.TRADING_CONFIG['symbol']
             )
+            # Assume the exchange provides a minimum order size (in dollars)
             self.min_qty = float(info['result']['list'][0]['lotSizeFilter']['minOrderQty'])
             logger.info("Loaded min order qty", min_qty=self.min_qty)
 
@@ -319,7 +318,7 @@ class TradeService:
             qty=str(order_qty),
             stop_loss=None,
             take_profit=None,
-            leverage="3"
+            leverage="1"
         )
         self.current_position = None
         self.current_order_qty = None
@@ -336,7 +335,7 @@ class TradeService:
                 qty=str(additional_qty),
                 stop_loss=None,
                 take_profit=None,
-                leverage="3"
+                leverage="1"
             )
             self.scaled_in = True
         else:
@@ -427,6 +426,45 @@ class TradeService:
         except Exception as e:
             logger.error("Error setting leverage", error=str(e))
 
+    async def execute_trade(self, side: str, qty: str,
+                              stop_loss: float = None, take_profit: float = None,
+                              leverage: str = None):
+        if not self.running:
+            return
+        # If computed position size is below the minimum, adjust it up.
+        if float(qty) < self.min_qty:
+            logger.warning("Computed position size below minimum; adjusting to minimum",
+                           required=self.min_qty, actual=qty)
+            qty = str(self.min_qty)
+        logger.info("Placing trade",
+                    side=side,
+                    size=qty,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    leverage=leverage)
+        order_params = {
+            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
+            "symbol": Config.TRADING_CONFIG['symbol'],
+            "side": side,
+            "orderType": "Market",
+            "qty": qty,
+            "stopLoss": str(stop_loss) if stop_loss is not None else None,
+            "takeProfit": str(take_profit) if take_profit is not None else None,
+            "leverage": leverage if leverage is not None else None
+        }
+        order_params = {k: v for k, v in order_params.items() if v is not None}
+        try:
+            response = await asyncio.to_thread(self.session.place_order, **order_params)
+            if response['retCode'] == 0:
+                await self._log_trade(side, qty)
+                logger.info("Trade executed successfully", order_id=response['result']['orderId'])
+            else:
+                error_msg = response.get('retMsg', 'Unknown error')
+                logger.error("Trade failed", error=error_msg)
+        except Exception as e:
+            logger.error("Trade execution error", error=str(e))
+            self.current_position = None
+
     async def run_trading_logic(self):
         """
         Main trading logic:
@@ -438,6 +476,7 @@ class TradeService:
         if not self.running:
             return
 
+        # Retrieve recent 1-minute candles from cache or DB.
         cached = redis_client.get("recent_candles")
         if cached:
             data = json.loads(cached)
@@ -498,7 +537,7 @@ class TradeService:
         market_regime = enhanced_get_market_regime(df_15)
         logger.info("Market regime detected", regime=market_regime)
 
-        # --- NEW PRE-TRADE CHECKS BASED ON MARKET REGIME ---
+        # NEW PRE-TRADE CHECKS BASED ON MARKET REGIME
         if (df_15.iloc[-1]["close"] > df_15["close"].mean() and 
             self.ml_service.predict_signal(df_15).lower() == "buy" and 
             market_regime == "downtrending"):
@@ -542,19 +581,10 @@ class TradeService:
             self.current_position = None
             self.current_order_qty = None
 
+        # --- NEW: ATR-based dynamic position sizing ---
         current_price = df_1min.iloc[-1]["close"]
-        fixed_leverage = 3
-        logger.info("Using fixed leverage", leverage=fixed_leverage)
 
-        portfolio_value = await self.get_portfolio_value()
-        if portfolio_value <= 0:
-            logger.warning("Portfolio value is 0; cannot size position.")
-            return
-
-        # New calculation: 95% of total equity times the leverage.
-        effective_trade_value = round(portfolio_value * 0.95 * fixed_leverage)
-        order_qty = effective_trade_value
-
+        # Compute technical features for stop loss calculation.
         boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
         bb_width = boll_temp.bollinger_wband()
         bb_width_percentile = bb_width.rank(pct=True).iloc[-1] if not bb_width.empty else 0.5
@@ -563,15 +593,53 @@ class TradeService:
             "macd_diff": last_candle["macd_diff"],
             "bb_width_percentile": bb_width_percentile
         }
-        stop_loss, take_profit = self.compute_sl_tp_dynamic(
-            current_price, df_15["atr"].iloc[-1], signal, market_regime, features, base_risk_multiplier=1.5
-        )
-        logger.info("Trade parameters computed", current_price=current_price,
-                    effective_trade_value=effective_trade_value,
-                    order_qty=order_qty,
-                    stop_loss=stop_loss, take_profit=take_profit,
-                    leverage=fixed_leverage)
 
+        # Compute stop loss and take profit dynamically.
+        stop_loss, take_profit = self.compute_sl_tp_dynamic(
+            current_price,
+            df_15["atr"].iloc[-1],
+            signal,
+            market_regime,
+            features,
+            base_risk_multiplier=1.5
+        )
+
+        # Get the current portfolio value.
+        portfolio_value = await self.get_portfolio_value()
+        if portfolio_value <= 0:
+            logger.warning("Portfolio value is 0; cannot size position.")
+            return
+
+        # Calculate stop distance and ensure it's nonzero.
+        stop_distance = abs(current_price - stop_loss)
+        if stop_distance == 0:
+            logger.warning("Stop distance is 0; cannot compute position size.")
+            return
+
+        # Risk 1% of your equity per trade.
+        risk_per_trade = 0.01 * portfolio_value
+
+        # Calculate position size in dollars:
+        # (Risk per trade / Stop Distance) * Current Price.
+        order_qty = (risk_per_trade / stop_distance) * current_price
+
+        # Round the order quantity to the nearest dollar.
+        order_qty = round(order_qty)
+
+        logger.info("ATR-based position sizing computed",
+                    portfolio_value=portfolio_value,
+                    risk_per_trade=risk_per_trade,
+                    stop_distance=stop_distance,
+                    order_qty=order_qty)
+
+        # If computed order size is below the exchange minimum, adjust to minimum.
+        if order_qty < self.min_qty:
+            logger.warning("Computed order size below minimum; adjusting to minimum",
+                           required=self.min_qty, actual=order_qty)
+            order_qty = self.min_qty
+
+        # Use fixed leverage (set to 1 here, since sizing is risk-based) or adjust as needed.
+        fixed_leverage = 1
         await self.set_trade_leverage(fixed_leverage)
         await self.execute_trade(
             side=signal,
@@ -584,43 +652,6 @@ class TradeService:
         self.last_trade_time = datetime.now(timezone.utc)
         self.current_position = signal.lower()
         self.current_order_qty = order_qty
-
-    async def execute_trade(self, side: str, qty: str,
-                              stop_loss: float = None, take_profit: float = None,
-                              leverage: str = None):
-        if not self.running:
-            return
-        if float(qty) < self.min_qty:
-            logger.error("Position size below minimum", required=self.min_qty, actual=qty)
-            return
-        logger.info("Placing trade",
-                    side=side,
-                    size=qty,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    leverage=leverage)
-        order_params = {
-            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-            "symbol": Config.TRADING_CONFIG['symbol'],
-            "side": side,
-            "orderType": "Market",
-            "qty": qty,
-            "stopLoss": str(stop_loss) if stop_loss is not None else None,
-            "takeProfit": str(take_profit) if take_profit is not None else None,
-            "leverage": leverage if leverage is not None else None
-        }
-        order_params = {k: v for k, v in order_params.items() if v is not None}
-        try:
-            response = await asyncio.to_thread(self.session.place_order, **order_params)
-            if response['retCode'] == 0:
-                await self._log_trade(side, qty)
-                logger.info("Trade executed successfully", order_id=response['result']['orderId'])
-            else:
-                error_msg = response.get('retMsg', 'Unknown error')
-                logger.error("Trade failed", error=error_msg)
-        except Exception as e:
-            logger.error("Trade execution error", error=str(e))
-            self.current_position = None
 
     async def stop(self):
         """

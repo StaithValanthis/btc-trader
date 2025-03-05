@@ -54,8 +54,7 @@ class MLService:
     Two-model architecture:
       1) TrendModel: Classify the trend as [Up, Down, Sideways].
       2) SignalModel: Classify next move as [Buy, Sell, Hold].
-    Uses an extended lookback (default=120) and merges signals to avoid countertrend trades.
-    Both training and inference share the exact same set of features to prevent shape mismatches.
+    Uses an extended lookback (default=120) and a consistent set of features for both training and inference.
     """
     def __init__(self, lookback=120):
         self.lookback = lookback
@@ -68,24 +67,23 @@ class MLService:
         self.running = True
         self.epochs = 20
 
-        # IMPORTANT: The definitive list of feature columns used in both training & inference
+        # Definitive list of feature columns used in both training & inference.
         self.feature_cols = [
             "close", "returns", "rsi", "macd", "macd_signal", "macd_diff",
             "bb_high", "bb_low", "bb_mavg", "atr",
-            "mfi", "stoch", "obv", "vwap", "ema_20", "cci",
+            "mfi",      # <-- Money Flow Index included as a feature
+            "stoch", "obv", "vwap", "ema_20", "cci",
             "bb_width", "lag1_return",
             "tenkan_sen", "kijun_sen", "senkou_span_a", "senkou_span_b",
             "sma_10", "ema_10", "smma_10",
-            "ADX",
-            # We'll add one-hot regime columns forcibly:
-            # "regime_uptrending", "regime_downtrending", "regime_sideways"
+            "ADX"
+            # One-hot regime columns (will be added dynamically if missing)
         ]
-        # We'll dynamically append "regime_uptrending", etc. if they're missing.
 
     async def initialize(self):
         """
-        Check if existing models are on disk. If so, we can load them. 
-        Otherwise, new models will be created at first training.
+        Check if existing models are on disk; if so, load them.
+        Otherwise, new models will be created upon first training.
         """
         try:
             if os.path.exists(SIGNAL_MODEL_PATH):
@@ -105,7 +103,7 @@ class MLService:
 
     async def schedule_daily_retrain(self):
         """
-        Retrain both models once every 24h in the background.
+        Retrain both models once every 24 hours.
         """
         while self.running:
             await self.train_model()
@@ -139,7 +137,7 @@ class MLService:
         df.set_index("time", inplace=True)
         df = df.asfreq('1min')
 
-        # Resample to 15-min
+        # Resample to 15-min candles
         df_15 = df.resample('15min').agg({
             'open': 'first',
             'high': 'max',
@@ -170,9 +168,13 @@ class MLService:
         )
         df_15["atr"] = atr_indicator.average_true_range()
 
-        # Additional features
+        # <-- Compute Money Flow Index (MFI) and include it as a feature.
         df_15["mfi"] = ta.volume.MFIIndicator(
-            high=df_15["high"], low=df_15["low"], close=df_15["close"], volume=df_15["volume"], window=14
+            high=df_15["high"],
+            low=df_15["low"],
+            close=df_15["close"],
+            volume=df_15["volume"],
+            window=14
         ).money_flow_index()
 
         stoch = ta.momentum.StochasticOscillator(
@@ -193,7 +195,7 @@ class MLService:
         df_15["bb_width"] = df_15["bb_high"] - df_15["bb_low"]
         df_15["lag1_return"] = df_15["returns"].shift(1)
 
-        # Ichimoku
+        # Ichimoku calculations
         ichimoku = ta.trend.IchimokuIndicator(
             high=df_15["high"], low=df_15["low"], window1=9, window2=26, window3=52
         )
@@ -202,12 +204,12 @@ class MLService:
         df_15["senkou_span_a"] = ichimoku.ichimoku_a()
         df_15["senkou_span_b"] = ichimoku.ichimoku_b()
 
-        # More MAs
+        # Additional moving averages
         df_15["sma_10"] = ta.trend.SMAIndicator(df_15["close"], window=10).sma_indicator()
         df_15["ema_10"] = ta.trend.EMAIndicator(df_15["close"], window=10).ema_indicator()
         df_15["smma_10"] = df_15["close"].ewm(alpha=1/10, adjust=False).mean()
 
-        # Regime detection
+        # Regime detection via ADX & SMA crossovers
         df_15["SMA20"] = df_15["close"].rolling(window=20).mean()
         df_15["SMA50"] = df_15["close"].rolling(window=50).mean()
         adx_indicator = ta.trend.ADXIndicator(
@@ -216,21 +218,21 @@ class MLService:
         df_15["ADX"] = adx_indicator.adx()
 
         df_15["ma_trend"] = np.where(df_15["SMA20"] > df_15["SMA50"], "up", "down")
-        df_15["regime"] = "sideways"  # default
+        df_15["regime"] = "sideways"  # default regime
         df_15.loc[(df_15["ADX"] > 25) & (df_15["ma_trend"]=="up"), "regime"] = "uptrending"
         df_15.loc[(df_15["ADX"] > 25) & (df_15["ma_trend"]=="down"), "regime"] = "downtrending"
 
-        # Trend targets
+        # Trend target
         regime_map = {"uptrending": 0, "downtrending": 1, "sideways": 2}
         df_15["trend_target"] = df_15["regime"].map(regime_map)
 
-        # One-hot encode the regime
+        # One-hot encode regime
         regime_dummies = pd.get_dummies(df_15["regime"], prefix="regime")
         df_15 = pd.concat([df_15, regime_dummies], axis=1)
 
         df_15.dropna(inplace=True)
 
-        # Signal target: [Buy=1, Sell=0, Hold=2]
+        # Signal target: 1=Buy, 0=Sell, 2=Hold based on next period returns
         conditions = [
             (df_15["returns"].shift(-1) > LABEL_EPSILON),
             (df_15["returns"].shift(-1) < -LABEL_EPSILON)
@@ -243,7 +245,7 @@ class MLService:
         logger.info("Trend label distribution", 
                     distribution=collections.Counter(df_15["trend_target"]))
 
-        # Ensure columns: add missing regime_* columns
+        # Ensure all feature columns are present; add regime columns if missing
         for cat_col in ["regime_uptrending", "regime_downtrending", "regime_sideways"]:
             if cat_col not in df_15.columns:
                 df_15[cat_col] = 0
@@ -253,7 +255,6 @@ class MLService:
         if missing_cols:
             logger.warning(f"Missing feature columns: {missing_cols}. They won't be used in training.")
 
-        # Convert to numeric & drop any NaN
         df_15[actual_cols] = df_15[actual_cols].apply(pd.to_numeric, errors="coerce")
         before_drop = len(df_15)
         df_15.dropna(subset=actual_cols, inplace=True)
@@ -273,7 +274,7 @@ class MLService:
             logger.warning("Not enough data after sequence creation.")
             return
 
-        # Time-based train/val split
+        # Time-based train/validation split
         split_idx_trend = int(len(X_trend) * 0.8)
         X_trend_train, X_trend_val = X_trend[:split_idx_trend], X_trend[split_idx_trend:]
         y_trend_train, y_trend_val = y_trend[:split_idx_trend], y_trend[split_idx_trend:]
@@ -282,17 +283,17 @@ class MLService:
         X_signal_train, X_signal_val = X_signal[:split_idx_signal], X_signal[split_idx_signal:]
         y_signal_train, y_signal_val = y_signal[:split_idx_signal], y_signal[split_idx_signal:]
 
-        # One-hot
+        # One-hot encoding
         y_trend_train_cat = to_categorical(y_trend_train, num_classes=3)
         y_trend_val_cat   = to_categorical(y_trend_val,   num_classes=3)
         y_signal_train_cat = to_categorical(y_signal_train, num_classes=3)
         y_signal_val_cat   = to_categorical(y_signal_val,   num_classes=3)
 
-        # Sample weights
+        # Sample weights for training
         weights_trend  = np.linspace(1, 2, num=len(X_trend_train))
         weights_signal = np.linspace(1, 2, num=len(X_signal_train))
 
-        # Final cast to float32, replace NaN/inf with 0
+        # Final cast to float32
         X_trend_train = np.nan_to_num(X_trend_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         X_trend_val   = np.nan_to_num(X_trend_val,   nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         y_trend_train_cat = np.nan_to_num(y_trend_train_cat, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -303,7 +304,6 @@ class MLService:
         y_signal_train_cat = np.nan_to_num(y_signal_train_cat, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         y_signal_val_cat   = np.nan_to_num(y_signal_val_cat,   nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-        # Debug shapes
         logger.info(f"X_trend_train.shape={X_trend_train.shape}, dtype={X_trend_train.dtype}")
         logger.info(f"X_signal_train.shape={X_signal_train.shape}, dtype={X_signal_train.dtype}")
 
@@ -351,12 +351,35 @@ class MLService:
                     final_loss=history_signal.history["loss"][-1] if history_signal.history["loss"] else None)
         self.signal_model_ready = True
 
+    def _build_model(self, input_shape, num_classes=3):
+        """
+        Builds a simple LSTM -> Attention -> Dense model.
+        """
+        inputs = Input(shape=input_shape)
+        x = LSTM(64, return_sequences=True)(inputs)
+        x = Dropout(0.2)(x)
+        x = AttentionLayer()(x)
+        outputs = Dense(num_classes, activation="softmax")(x)
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+        return model
+
+    def _make_sequences(self, features, labels, lookback):
+        """
+        Converts the entire dataset into (X, y) sequences of length=lookback.
+        """
+        X, y = [], []
+        for i in range(len(features) - lookback):
+            X.append(features[i : i + lookback])
+            y.append(labels[i + lookback])
+        return np.array(X), np.array(y)
+
     def predict_signal(self, recent_data: pd.DataFrame) -> str:
         """
-        Ensemble approach: 
-          1) TrendModel => up/down/side
-          2) SignalModel => buy/sell/hold
-          3) If mismatch with strong trend, override to "Hold"
+        Ensemble approach:
+          1) TrendModel => up/down/side.
+          2) SignalModel => buy/sell/hold.
+          3) Override to "Hold" if there's a strong trend mismatch.
         """
         if not self.trend_model_ready or not self.signal_model_ready:
             logger.warning("ML models not ready; returning 'Hold'.")
@@ -367,10 +390,10 @@ class MLService:
             return "Hold"
 
         trend_pred = self.trend_model.predict(data_seq)
-        trend_class = np.argmax(trend_pred, axis=1)[0]  # 0=up,1=down,2=side
+        trend_class = np.argmax(trend_pred, axis=1)[0]
 
         signal_pred = self.signal_model.predict(data_seq)
-        signal_class = np.argmax(signal_pred, axis=1)[0]  # 0=sell,1=buy,2=hold
+        signal_class = np.argmax(signal_pred, axis=1)[0]
 
         trend_label = {0: "uptrending", 1: "downtrending", 2: "sideways"}.get(trend_class, "sideways")
         signal_label = {0: "Sell", 1: "Buy", 2: "Hold"}.get(signal_class, "Hold")
@@ -387,37 +410,10 @@ class MLService:
                     final_signal=final_label)
         return final_label
 
-    # ================================
-    #  Helper Methods
-    # ================================
-    def _build_model(self, input_shape, num_classes=3):
+    def _prepare_data_sequence(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Simple LSTM -> Attention -> Dense architecture for classification
-        """
-        inputs = Input(shape=input_shape)
-        x = LSTM(64, return_sequences=True)(inputs)
-        x = Dropout(0.2)(x)
-        x = AttentionLayer()(x)
-        outputs = Dense(num_classes, activation="softmax")(x)
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
-        return model
-
-    def _make_sequences(self, features, labels, lookback):
-        """
-        Convert the entire dataset into (X, y) sequences of length=lookback
-        """
-        X, y = [], []
-        for i in range(len(features) - lookback):
-            X.append(features[i : i + lookback])
-            y.append(labels[i + lookback])
-        return np.array(X), np.array(y)
-
-    def _prepare_data_sequence(self, df: pd.DataFrame):
-        """
-        Prepare a single inference sequence from recent_data 
-        using the same transformations as in train_model.
-        If not enough data => returns None.
+        Prepares a single inference sequence from recent_data using the same transformations as training.
+        Returns None if there is insufficient data.
         """
         data = df.copy()
         data = data.asfreq('1min')
@@ -435,7 +431,7 @@ class MLService:
             logger.warning("Not enough 15-min bars for inference.")
             return None
 
-        # Repeat the same technical indicator calculations
+        # Compute technical indicators
         df_15["returns"] = df_15["close"].pct_change()
         df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
         macd = ta.trend.MACD(df_15["close"], window_slow=26, window_fast=12, window_sign=9)
@@ -453,16 +449,19 @@ class MLService:
         )
         df_15["atr"] = atr_indicator.average_true_range()
 
+        # <-- Compute Money Flow Index (MFI)
         df_15["mfi"] = ta.volume.MFIIndicator(
-            high=df_15["high"], low=df_15["low"], 
-            close=df_15["close"], volume=df_15["volume"], window=14
+            high=df_15["high"],
+            low=df_15["low"],
+            close=df_15["close"],
+            volume=df_15["volume"],
+            window=14
         ).money_flow_index()
 
-        stoch = ta.momentum.StochasticOscillator(
+        df_15["stoch"] = ta.momentum.StochasticOscillator(
             high=df_15["high"], low=df_15["low"], close=df_15["close"],
             window=14, smooth_window=3
-        )
-        df_15["stoch"] = stoch.stoch()
+        ).stoch()
         df_15["obv"] = ta.volume.OnBalanceVolumeIndicator(
             close=df_15["close"], volume=df_15["volume"]
         ).on_balance_volume()
@@ -488,7 +487,6 @@ class MLService:
         df_15["ema_10"] = ta.trend.EMAIndicator(df_15["close"], window=10).ema_indicator()
         df_15["smma_10"] = df_15["close"].ewm(alpha=1/10, adjust=False).mean()
 
-        # Regime
         df_15["SMA20"] = df_15["close"].rolling(window=20).mean()
         df_15["SMA50"] = df_15["close"].rolling(window=50).mean()
         adx_indicator = ta.trend.ADXIndicator(
@@ -509,24 +507,17 @@ class MLService:
 
         df_15.dropna(inplace=True)
 
-        # Build final sequence from self.feature_cols
         actual_cols = [c for c in self.feature_cols if c in df_15.columns]
-        # Convert to numeric, drop NaN
         df_15[actual_cols] = df_15[actual_cols].apply(pd.to_numeric, errors="coerce")
         df_15.dropna(subset=actual_cols, inplace=True)
 
-        # Grab last `self.lookback` rows
         recent_slice = df_15.tail(self.lookback).copy()
         if len(recent_slice) < self.lookback:
             missing = self.lookback - len(recent_slice)
-            if len(df_15) == 0:
-                logger.warning("No data left after indicator calculations.")
-                return None
-            # Pad with the earliest row in recent_slice
             pad_df = pd.DataFrame([recent_slice.iloc[0].values]*missing, columns=recent_slice.columns)
             recent_slice = pd.concat([pad_df, recent_slice], ignore_index=True)
 
         seq = recent_slice[actual_cols].values
         seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        seq = np.expand_dims(seq, axis=0)  # shape => (1, lookback, num_features)
+        seq = np.expand_dims(seq, axis=0)
         return seq
