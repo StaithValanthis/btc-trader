@@ -15,3 +15,7 @@ redis==4.5.1
 
 # Technical indicators
 ta==0.10.1
+
+# For hyperparameter tuning and feature importance analysis
+keras-tuner>=1.0.3
+shap>=0.41.0

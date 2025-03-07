@@ -1,4 +1,4 @@
-# Updated file: app/services/trade_service.py
+# File: app/services/trade_service.py
 
 import warnings
 # Suppress RuntimeWarnings from ta.trend (e.g., division warnings)
@@ -273,7 +273,7 @@ class TradeService:
                     df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
                     macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
                     df_15["macd"] = macd.macd()
-                    df_15["macd_signal"] = macd.macd_signal()
+                    # Removed macd_signal
                     df_15["macd_diff"] = macd.macd_diff()
                     boll = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
                     df_15["bb_high"] = boll.bollinger_hband()
@@ -289,7 +289,7 @@ class TradeService:
                     last_candle = df_15.iloc[-1]
                     boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
                     bb_width = boll_temp.bollinger_wband()
-                    bb_width_percentile = bb_width.rank(pct=True).iloc[-1] if not bb_width.empty else 0.5
+                    bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0.5
                     features = {
                         "rsi": last_candle["rsi"],
                         "macd_diff": last_candle["macd_diff"],
@@ -342,7 +342,7 @@ class TradeService:
             logger.info("Market conditions not favorable for scaling in")
 
     async def get_recent_candles(self):
-        MIN_REQUIRED = 210  # Minimum number of 1-minute candles required (~3.5 hours)
+        MIN_REQUIRED = 210  # Approximately 3.5 hours of 1-minute candles
         cached = redis_client.get("recent_candles")
         if cached:
             data = json.loads(cached)
@@ -411,7 +411,6 @@ class TradeService:
             logger.error("Failed to log trade", error=str(e))
 
     async def set_trade_leverage(self, leverage: int):
-        # For inverse contracts, leverage setting is not required; skip if category is "inverse"
         if Config.BYBIT_CONFIG.get("category", "inverse") == "inverse":
             logger.info("Skipping set_leverage for inverse contracts")
             return
@@ -431,7 +430,6 @@ class TradeService:
                               leverage: str = None):
         if not self.running:
             return
-        # If computed position size is below the minimum, adjust it up.
         if float(qty) < self.min_qty:
             logger.warning("Computed position size below minimum; adjusting to minimum",
                            required=self.min_qty, actual=qty)
@@ -473,185 +471,169 @@ class TradeService:
           - Generate trade signal,
           - Place a trade if conditions are met.
         """
-        if not self.running:
-            return
+        while self.running:
+            # Wait until both ML models are ready before making predictions
+            if not self.ml_service.trend_model_ready or not self.ml_service.signal_model_ready:
+                logger.info("ML models not ready, waiting before evaluating trade signal.")
+                await asyncio.sleep(10)
+                continue
 
-        # Retrieve recent 1-minute candles from cache or DB.
-        cached = redis_client.get("recent_candles")
-        if cached:
-            data = json.loads(cached)
-            df_1min = pd.DataFrame(data)
-            df_1min['time'] = pd.to_datetime(df_1min['time'])
-            df_1min.sort_values("time", inplace=True)
-            df_1min.set_index("time", inplace=True)
-        else:
-            rows = await Database.fetch("""
-                SELECT time, open, high, low, close, volume
-                FROM candles
-                ORDER BY time DESC
-                LIMIT 1800
-            """)
-            if not rows or len(rows) < 60:
-                logger.warning("Not enough 1-minute candle data for prediction yet.")
-                return
-            df_1min = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-            df_1min['time'] = pd.to_datetime(df_1min['time'])
-            df_1min.sort_values("time", inplace=True)
-            df_1min.set_index("time", inplace=True)
-            redis_client.setex("recent_candles", 60, df_1min.reset_index().to_json(orient="records"))
-
-        df_1min = df_1min.asfreq('1min')
-        df_15 = df_1min.resample('15min').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).ffill().dropna()
-
-        if len(df_15) < 14:
-            logger.warning("Not enough 15-minute candle data for ML prediction.")
-            return
-
-        df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
-        macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
-        df_15["macd"] = macd.macd()
-        df_15["macd_signal"] = macd.macd_signal()
-        df_15["macd_diff"] = macd.macd_diff()
-        boll = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
-        df_15["bb_high"] = boll.bollinger_hband()
-        df_15["bb_low"] = boll.bollinger_lband()
-        df_15["bb_mavg"] = boll.bollinger_mavg()
-        atr_indicator = ta.volatility.AverageTrueRange(
-            high=df_15["high"],
-            low=df_15["low"],
-            close=df_15["close"],
-            window=14
-        )
-        df_15["atr"] = atr_indicator.average_true_range()
-        df_15.dropna(subset=["close", "atr", "rsi"], inplace=True)
-        if len(df_15) < 14:
-            logger.warning("Not enough 15-minute candle data after cleaning.")
-            return
-
-        market_regime = enhanced_get_market_regime(df_15)
-        logger.info("Market regime detected", regime=market_regime)
-
-        # NEW PRE-TRADE CHECKS BASED ON MARKET REGIME
-        if (df_15.iloc[-1]["close"] > df_15["close"].mean() and 
-            self.ml_service.predict_signal(df_15).lower() == "buy" and 
-            market_regime == "downtrending"):
-            logger.info("Market is in a downtrend. Skipping Buy trade.")
-            return
-        if (df_15.iloc[-1]["close"] < df_15["close"].mean() and 
-            self.ml_service.predict_signal(df_15).lower() == "sell" and 
-            market_regime == "uptrending"):
-            logger.info("Market is in an uptrend. Skipping Sell trade.")
-            return
-        # -------------------------------------------------------
-
-        signal = self.ml_service.predict_signal(df_15)
-        logger.info("15-minute ML prediction", signal=signal)
-        if signal.lower() == "hold":
-            return
-
-        last_candle = df_15.iloc[-1]
-        pivot = (last_candle["high"] + last_candle["low"] + last_candle["close"]) / 3
-        resistance = pivot + (last_candle["high"] - pivot)
-        support = pivot - (pivot - last_candle["low"])
-        buffer_pct = 0.01
-        resistance_threshold = last_candle["close"] * (1 + buffer_pct)
-        support_threshold = last_candle["close"] * (1 - buffer_pct)
-        if signal.lower() == "buy" and last_candle["close"] > resistance_threshold:
-            logger.info("15-minute price near resistance; skipping Buy trade.")
-            return
-        if signal.lower() == "sell" and last_candle["close"] < support_threshold:
-            logger.info("15-minute price near support; skipping Sell trade.")
-            return
-
-        if await self.check_open_trade():
-            if self.current_position is not None and self.current_position.lower() != signal.lower():
-                logger.info("Signal reversal detected. Exiting current trade before new trade.")
-                await self.exit_trade()
-                await asyncio.sleep(1)
+            # Retrieve recent 1-minute candles (from cache or DB)
+            cached = redis_client.get("recent_candles")
+            if cached:
+                data = json.loads(cached)
+                df_1min = pd.DataFrame(data)
+                df_1min['time'] = pd.to_datetime(df_1min['time'])
+                df_1min.sort_values("time", inplace=True)
+                df_1min.set_index("time", inplace=True)
             else:
-                logger.info("Existing position matches new signal; skipping new trade.")
-                return
-        else:
-            self.current_position = None
-            self.current_order_qty = None
+                rows = await Database.fetch("""
+                    SELECT time, open, high, low, close, volume
+                    FROM candles
+                    ORDER BY time DESC
+                    LIMIT 1800
+                """)
+                if not rows or len(rows) < 60:
+                    logger.warning("Not enough 1-minute candle data for prediction yet.")
+                    await asyncio.sleep(60)
+                    continue
+                df_1min = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+                df_1min['time'] = pd.to_datetime(df_1min['time'])
+                df_1min.sort_values("time", inplace=True)
+                df_1min.set_index("time", inplace=True)
+                redis_client.setex("recent_candles", 60, df_1min.reset_index().to_json(orient="records"))
 
-        # --- NEW: ATR-based dynamic position sizing ---
-        current_price = df_1min.iloc[-1]["close"]
+            df_1min = df_1min.asfreq('1min')
+            df_15 = df_1min.resample('15min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).ffill().dropna()
 
-        # Compute technical features for stop loss calculation.
-        boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
-        bb_width = boll_temp.bollinger_wband()
-        bb_width_percentile = bb_width.rank(pct=True).iloc[-1] if not bb_width.empty else 0.5
-        features = {
-            "rsi": last_candle["rsi"],
-            "macd_diff": last_candle["macd_diff"],
-            "bb_width_percentile": bb_width_percentile
-        }
+            if len(df_15) < 14:
+                logger.warning("Not enough 15-minute candle data for ML prediction.")
+                await asyncio.sleep(60)
+                continue
 
-        # Compute stop loss and take profit dynamically.
-        stop_loss, take_profit = self.compute_sl_tp_dynamic(
-            current_price,
-            df_15["atr"].iloc[-1],
-            signal,
-            market_regime,
-            features,
-            base_risk_multiplier=1.5
-        )
+            df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
+            macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
+            df_15["macd"] = macd.macd()
+            df_15["macd_diff"] = macd.macd_diff()
+            boll = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
+            df_15["bb_high"] = boll.bollinger_hband()
+            df_15["bb_low"] = boll.bollinger_lband()
+            df_15["bb_mavg"] = boll.bollinger_mavg()
+            atr_indicator = ta.volatility.AverageTrueRange(
+                high=df_15["high"],
+                low=df_15["low"],
+                close=df_15["close"],
+                window=14
+            )
+            df_15["atr"] = atr_indicator.average_true_range()
+            df_15.dropna(subset=["close", "atr", "rsi"], inplace=True)
+            if len(df_15) < 14:
+                logger.warning("Not enough 15-minute candle data after cleaning.")
+                await asyncio.sleep(60)
+                continue
 
-        # Get the current portfolio value.
-        portfolio_value = await self.get_portfolio_value()
-        if portfolio_value <= 0:
-            logger.warning("Portfolio value is 0; cannot size position.")
-            return
+            market_regime = enhanced_get_market_regime(df_15)
+            logger.info("Market regime detected", regime=market_regime)
 
-        # Calculate stop distance and ensure it's nonzero.
-        stop_distance = abs(current_price - stop_loss)
-        if stop_distance == 0:
-            logger.warning("Stop distance is 0; cannot compute position size.")
-            return
+            signal = self.ml_service.predict_signal(df_15)
+            logger.info("15-minute ML prediction", signal=signal)
+            if signal.lower() == "hold":
+                await asyncio.sleep(60)
+                continue
 
-        # Risk 1% of your equity per trade.
-        risk_per_trade = 0.01 * portfolio_value
+            last_candle = df_15.iloc[-1]
+            pivot = (last_candle["high"] + last_candle["low"] + last_candle["close"]) / 3
+            resistance = pivot + (last_candle["high"] - pivot)
+            support = pivot - (pivot - last_candle["low"])
+            buffer_pct = 0.01
+            resistance_threshold = last_candle["close"] * (1 + buffer_pct)
+            support_threshold = last_candle["close"] * (1 - buffer_pct)
+            if signal.lower() == "buy" and last_candle["close"] > resistance_threshold:
+                logger.info("15-minute price near resistance; skipping Buy trade.")
+                await asyncio.sleep(60)
+                continue
+            if signal.lower() == "sell" and last_candle["close"] < support_threshold:
+                logger.info("15-minute price near support; skipping Sell trade.")
+                await asyncio.sleep(60)
+                continue
 
-        # Calculate position size in dollars:
-        # (Risk per trade / Stop Distance) * Current Price.
-        order_qty = (risk_per_trade / stop_distance) * current_price
+            if await self.check_open_trade():
+                if self.current_position is not None and self.current_position.lower() != signal.lower():
+                    logger.info("Signal reversal detected. Exiting current trade before new trade.")
+                    await self.exit_trade()
+                    await asyncio.sleep(1)
+                else:
+                    logger.info("Existing position matches new signal; skipping new trade.")
+                    await asyncio.sleep(60)
+                    continue
+            else:
+                self.current_position = None
+                self.current_order_qty = None
 
-        # Round the order quantity to the nearest dollar.
-        order_qty = round(order_qty)
+            current_price = df_1min.iloc[-1]["close"]
+            boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
+            bb_width = boll_temp.bollinger_wband()
+            bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0.5
+            features = {
+                "rsi": last_candle["rsi"],
+                "macd_diff": last_candle["macd_diff"],
+                "bb_width_percentile": bb_width_percentile
+            }
+            stop_loss, take_profit = self.compute_sl_tp_dynamic(
+                current_price,
+                df_15["atr"].iloc[-1],
+                signal,
+                market_regime,
+                features,
+                base_risk_multiplier=1.5
+            )
+            portfolio_value = await self.get_portfolio_value()
+            if portfolio_value <= 0:
+                logger.warning("Portfolio value is 0; cannot size position.")
+                await asyncio.sleep(60)
+                continue
 
-        logger.info("ATR-based position sizing computed",
-                    portfolio_value=portfolio_value,
-                    risk_per_trade=risk_per_trade,
-                    stop_distance=stop_distance,
-                    order_qty=order_qty)
+            stop_distance = abs(current_price - stop_loss)
+            if stop_distance == 0:
+                logger.warning("Stop distance is 0; cannot compute position size.")
+                await asyncio.sleep(60)
+                continue
 
-        # If computed order size is below the exchange minimum, adjust to minimum.
-        if order_qty < self.min_qty:
-            logger.warning("Computed order size below minimum; adjusting to minimum",
-                           required=self.min_qty, actual=order_qty)
-            order_qty = self.min_qty
+            risk_per_trade = 0.01 * portfolio_value
+            order_qty = (risk_per_trade / stop_distance) * current_price
+            order_qty = round(order_qty)
+            logger.info("ATR-based position sizing computed",
+                        portfolio_value=portfolio_value,
+                        risk_per_trade=risk_per_trade,
+                        stop_distance=stop_distance,
+                        order_qty=order_qty)
 
-        # Use fixed leverage (set to 1 here, since sizing is risk-based) or adjust as needed.
-        fixed_leverage = 1
-        await self.set_trade_leverage(fixed_leverage)
-        await self.execute_trade(
-            side=signal,
-            qty=str(order_qty),
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            leverage=str(fixed_leverage)
-        )
+            if order_qty < self.min_qty:
+                logger.warning("Computed order size below minimum; adjusting to minimum",
+                               required=self.min_qty, actual=order_qty)
+                order_qty = self.min_qty
 
-        self.last_trade_time = datetime.now(timezone.utc)
-        self.current_position = signal.lower()
-        self.current_order_qty = order_qty
+            fixed_leverage = 1
+            await self.set_trade_leverage(fixed_leverage)
+            await self.execute_trade(
+                side=signal,
+                qty=str(order_qty),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                leverage=str(fixed_leverage)
+            )
+
+            self.last_trade_time = datetime.now(timezone.utc)
+            self.current_position = signal.lower()
+            self.current_order_qty = order_qty
+
+            await asyncio.sleep(60)
 
     async def stop(self):
         """

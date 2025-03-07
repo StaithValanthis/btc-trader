@@ -1,5 +1,4 @@
-# File: app/init.py
-
+# app/init.py
 import asyncio
 from app.utils.logger import logger
 from app.core import Database, BybitMarketData, Config
@@ -10,24 +9,18 @@ class TradingBot:
     def __init__(self):
         self.bybit = BybitMarketData()
         self.trade_service = TradeService()
-        self.candle_service = CandleService(interval_seconds=60)  # Aggregates 1-minute candles
+        self.candle_service = CandleService(interval_seconds=3600)  # Aggregates 1-hour candles
         self.running = False
 
     async def run(self):
         try:
-            # Run startup checks (includes backfilling candles if necessary)
             await StartupChecker.run_checks()
-
             logger.info("Initializing database...")
             await Database.initialize()
             await self.trade_service.initialize()
-
-            # Start live candle aggregation.
             await self.candle_service.start()
-
             self.running = True
             logger.info("Starting main tasks...")
-
             await asyncio.gather(
                 self.bybit.run(),
                 self._monitor_system(),
@@ -56,7 +49,7 @@ class TradingBot:
     async def _trading_loop(self):
         while self.running:
             await self.trade_service.run_trading_logic()
-            await asyncio.sleep(60)  # Run trading logic every 1 minute
+            await asyncio.sleep(3600)  # Run trading logic every 1 hour
 
     async def stop(self):
         self.running = False
