@@ -5,7 +5,7 @@ from structlog import get_logger
 from app.core.config import Config
 from app.core.database import Database
 from pybit.unified_trading import HTTP
-from app.services.backfill_service import backfill_mexc_kline
+from app.services.backfill_service import maybe_backfill_candles
 
 logger = get_logger(__name__)
 
@@ -23,9 +23,9 @@ class StartupChecker:
 
         # Automatically backfill candles if fewer than 2000 rows exist.
         # Updated to fetch 365 days of 1-min candles.
-        await backfill_mexc_kline(
+        await maybe_backfill_candles(
             min_rows=2000,
-            symbol="BTC_USD",
+            symbol="BTCUSD",
             interval=1,
             days_to_fetch=10
         )
@@ -36,15 +36,6 @@ class StartupChecker:
     def _check_env_vars(cls):
         if not Config.BYBIT_CONFIG['api_key'] or not Config.BYBIT_CONFIG['api_secret']:
             raise EnvironmentError("BYBIT_API_KEY or BYBIT_API_SECRET not set.")
-
-    @classmethod
-    async def _check_db_connection(cls):
-        try:
-            val = await Database.fetchval("SELECT 1")
-            assert val == 1
-            logger.info("Database connection successful")
-        except Exception as e:
-            raise ConnectionError(f"Database connection failed: {e}")
 
     @classmethod
     async def _check_bybit_connection(cls):
@@ -58,3 +49,18 @@ class StartupChecker:
             logger.info("Bybit API connection successful")
         except Exception as e:
             raise ConnectionError(f"Bybit API connection failed: {e}")
+
+    @classmethod
+    def _check_env_vars(cls):
+        # Check that MEXC API credentials are provided
+        if not Config.MEXC_CONFIG['api_key'] or not Config.MEXC_CONFIG['api_secret']:
+            raise EnvironmentError("MEXC_API_KEY or MEXC_API_SECRET not set.")
+
+    @classmethod
+    async def _check_db_connection(cls):
+        try:
+            val = await Database.fetchval("SELECT 1")
+            assert val == 1
+            logger.info("Database connection successful")
+        except Exception as e:
+            raise ConnectionError(f"Database connection failed: {e}")

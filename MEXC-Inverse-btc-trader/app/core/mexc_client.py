@@ -16,11 +16,14 @@ class MexcClient:
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
-            "X-MEXC-APIKEY": self.api_key
+            "X-MEXC-APIKEY": self.api_key,
+            "User-Agent": "Mozilla/5.0",         # Standard user agent header
+            "Accept": "application/json",         # Accept JSON responses
+            "Connection": "close"                 # Force connection closure after each request
         })
     
     def _sign(self, params):
-        # Sign parameters sorted alphabetically (example; adjust as needed)
+        # Sign parameters sorted alphabetically
         sorted_params = "&".join(f"{k}={params[k]}" for k in sorted(params))
         signature = hmac.new(self.api_secret.encode(), sorted_params.encode(), hashlib.sha256).hexdigest()
         return signature
@@ -31,7 +34,7 @@ class MexcClient:
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = self._sign(params)
         url = f"{self.base_url}{endpoint}"
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, timeout=60)  # Increased timeout to 60 seconds
         return response.json()
 
     def _post(self, endpoint, data=None):
@@ -40,7 +43,7 @@ class MexcClient:
         data["timestamp"] = int(time.time() * 1000)
         data["signature"] = self._sign(data)
         url = f"{self.base_url}{endpoint}"
-        response = self.session.post(url, json=data)
+        response = self.session.post(url, json=data, timeout=60)  # Increased timeout to 60 seconds
         return response.json()
 
     def get_instruments_info(self, symbol):

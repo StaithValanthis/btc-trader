@@ -33,8 +33,7 @@ except ImportError:
     shap = None
     print("SHAP not installed; feature importance analysis will be skipped.")
 
-# Updated: Import the MEXC backfill function instead of the Bybit version.
-from app.services.backfill_service import backfill_mexc_kline
+from app.services.backfill_service import backfill_bybit_kline
 from app.core.database import Database
 from app.core.config import Config
 
