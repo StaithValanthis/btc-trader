@@ -1,5 +1,3 @@
-# File: app/services/ml_service.py
-
 import asyncio
 import os
 import pandas as pd
@@ -8,7 +6,7 @@ import tensorflow as tf
 from datetime import datetime, timezone
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (LSTM, Dense, Dropout, Input, Layer, Conv1D,
-                                     Bidirectional, Add, BatchNormalization)
+                                     Bidirectional, BatchNormalization)
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.utils import to_categorical
 import ta
@@ -20,20 +18,20 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.ensemble import RandomForestClassifier
 
-# For automated hyperparameter tuning
+# Automated hyperparameter tuning
 try:
     import keras_tuner as kt
 except ImportError:
     raise ImportError("Please install keras-tuner via: pip install keras-tuner")
 
-# For optional SHAP-based feature importance analysis
+# Optional SHAP feature importance analysis
 try:
     import shap
 except ImportError:
     shap = None
     print("SHAP not installed; feature importance analysis will be skipped.")
 
-from app.services.backfill_service import backfill_bybit_kline
+# Removed import of backfill_bybit_kline to break circular dependency.
 from app.core.database import Database
 from app.core.config import Config
 
@@ -84,7 +82,7 @@ def focal_loss(gamma=2.0, alpha=0.25):
     return focal_loss_fixed
 
 # ---------------------
-# Utility: Drop Highly Correlated Features
+# Utility Functions
 # ---------------------
 def drop_highly_correlated_features(df, threshold=0.95):
     corr_matrix = df.corr().abs()
@@ -92,18 +90,12 @@ def drop_highly_correlated_features(df, threshold=0.95):
     to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
     return df.drop(columns=to_drop), to_drop
 
-# ---------------------
-# Utility: Train/Val/Test Split (70/15/15)
-# ---------------------
 def train_val_test_split(X, y, train_frac=0.7, val_frac=0.15):
     total = len(X)
     train_end = int(total * train_frac)
     val_end = int(total * (train_frac + val_frac))
     return X[:train_end], y[:train_end], X[train_end:val_end], y[train_end:val_end], X[val_end:], y[val_end:]
 
-# ---------------------
-# Utility: Walk-Forward Validation (Simple Implementation)
-# ---------------------
 def walk_forward_validation(X, y, build_model, num_folds=3):
     fold_size = int(len(X) / num_folds)
     losses = []
@@ -128,16 +120,10 @@ def walk_forward_validation(X, y, build_model, num_folds=3):
 # ---------------------
 class MLService:
     """
-    MLService now trains two completely separate models:
-      - A dedicated trend model.
-      - A dedicated signal model trained as an ensemble.
-    
-    The trend model uses composite features from 30-min and 60-min data.
-    The signal model uses features focused on short-term movements computed on 15-min bars.
-    
-    Initial training is performed at startup and retraining/tuning occurs every 4 hours.
-    Data is split 70/15/15 for training/validation/testing with evaluation via confusion matrix
-    and weighted F1 score.
+    MLService trains two separate models:
+      - A dedicated trend model using composite features from 30-min and 60-min data.
+      - A dedicated signal model (or ensemble) using features computed on 15-min bars.
+    Initial training is done at startup, and retraining occurs every 4 hours.
     """
     def __init__(
         self,
@@ -156,29 +142,20 @@ class MLService:
         self.focal_alpha = focal_alpha
         self.batch_size = batch_size
         self.ensemble_size = ensemble_size
-
         self.use_tuned_trend_model = use_tuned_trend_model
         self.use_tuned_signal_model = use_tuned_signal_model
-
-        self.trend_model = None        # Dedicated trend model
-        self.signal_models = []        # Ensemble of signal models
-
+        self.trend_model = None
+        self.signal_models = []
         self.pca = None
         self.initialized = False
         self.running = True
         self.epochs = 20
-
         self.trend_model_ready = False
         self.signal_model_ready = False
-
-        # For the trend model we use the composite features (3 features)
         self.trend_feature_cols = ["sma_diff", "adx", "dmi_diff"]
-        # For the signal model we use the following features (9 features)
         self.signal_feature_cols = ["close", "returns", "rsi", "macd_diff", "obv", "vwap", "mfi", "bb_width", "atr"]
         self.actual_trend_cols = None
         self.actual_signal_cols = None
-
-        # Tuning data placeholders
         self._trend_tuning_data = None
         self._signal_tuning_data = None
         self._signal_input_shape = None
@@ -203,7 +180,6 @@ class MLService:
             self.initialized = False
 
     async def schedule_daily_retrain(self):
-        # Retrain every 4 hours (14400 seconds)
         while self.running:
             logger.info("Starting retrain cycle (every 4 hours)...")
             if self.use_tuned_trend_model:
@@ -221,19 +197,13 @@ class MLService:
         self.running = False
         logger.info("MLService stopped.")
 
-    # ---------------------
-    # Helper: Create Sequences
-    # ---------------------
     def _make_sequences(self, features, labels, lookback):
         X, y = [], []
         for i in range(len(features) - lookback):
-            X.append(features[i : i + lookback])
+            X.append(features[i: i + lookback])
             y.append(labels[i + lookback])
         return np.array(X), np.array(y)
 
-    # ---------------------
-    # Trend Model Methods
-    # ---------------------
     def _build_trend_model(self, input_shape, num_classes=3, dropout_rate=0.2, lstm_units=64):
         inputs = Input(shape=input_shape)
         x = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(inputs)
@@ -298,7 +268,7 @@ class MLService:
         scaler = RobustScaler()
         composite[trend_features] = scaler.fit_transform(composite[trend_features])
         X, y = self._make_sequences(composite[trend_features].values, composite["trend_target"].values, self.lookback)
-        X_train, y_train, X_val, y_val, _ , _ = train_val_test_split(X, y)
+        X_train, y_train, X_val, y_val, _, _ = train_val_test_split(X, y)
         logger.info("Starting trend model tuning...")
         tuner = kt.RandomSearch(
             self.build_trend_model_tuner,
@@ -308,14 +278,17 @@ class MLService:
             directory="kt_dir",
             project_name="trend_model_tuning"
         )
-        await asyncio.to_thread(lambda: tuner.search(
-            X_train, to_categorical(y_train, num_classes=3),
-            validation_data=(X_val, to_categorical(y_val, num_classes=3)),
-            epochs=10,
-            batch_size=self.batch_size,
-            callbacks=[EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)],
-            verbose=0
-        ))
+        def run_tuner_search():
+            tuner.search(
+                X_train,
+                to_categorical(y_train, num_classes=3),
+                validation_data=(X_val, to_categorical(y_val, num_classes=3)),
+                epochs=10,
+                batch_size=self.batch_size,
+                callbacks=[EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)],
+                verbose=0
+            )
+        await asyncio.to_thread(run_tuner_search)
         best_hp = tuner.get_best_hyperparameters(num_trials=1)[0]
         logger.info("Trend tuning complete. Best hyperparameters found:", best_hp.values)
         best_model = self.build_trend_model_tuner(best_hp)
@@ -330,7 +303,6 @@ class MLService:
         lstm_units = hp.Int("lstm_units", 32, 128, step=32, default=64)
         input_shape = (self.lookback, len(self.actual_trend_cols))
         model = self._build_trend_model(input_shape, num_classes=3, dropout_rate=dropout_rate, lstm_units=lstm_units)
-        # Dummy training run for tuner compatibility
         model.fit(
             np.zeros((10, self.lookback, len(self.actual_trend_cols))),
             to_categorical(np.zeros(10), num_classes=3),
@@ -342,33 +314,6 @@ class MLService:
 
     async def train_trend_model(self):
         await self.tune_trend_model()
-
-    # ---------------------
-    # Signal Model Methods
-    # ---------------------
-    def prepare_signal_features(self, df):
-        df = df.copy()
-        df.index = pd.to_datetime(df.index)
-        df_15 = df.resample("15min").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).ffill().dropna()
-        df_15["returns"] = df_15["close"].pct_change()
-        df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
-        df_15["macd_diff"] = ta.trend.MACD(df_15["close"], window_slow=26, window_fast=12, window_sign=9).macd_diff()
-        df_15["obv"] = ta.volume.OnBalanceVolumeIndicator(close=df_15["close"], volume=df_15["volume"]).on_balance_volume()
-        df_15["vwap"] = ta.volume.VolumeWeightedAveragePrice(
-            high=df_15["high"], low=df_15["low"], close=df_15["close"], volume=df_15["volume"]
-        ).volume_weighted_average_price()
-        df_15["mfi"] = ta.volume.MFIIndicator(
-            high=df_15["high"], low=df_15["low"], close=df_15["close"], volume=df_15["volume"], window=14
-        ).money_flow_index()
-        for col in ["rsi", "macd_diff", "obv", "vwap", "mfi"]:
-            df_15[col] = df_15[col].ffill()
-        return df_15
 
     async def tune_signal_model(self):
         logger.info("Tuning signal model: fetching data...")
@@ -387,8 +332,11 @@ class MLService:
         self._signal_tuning_data = await _fetch_signal_data()
         df = self._signal_tuning_data.copy()
         df_15 = df.resample("15min").agg({
-            "open": "first", "high": "max", "low": "min",
-            "close": "last", "volume": "sum"
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
         }).ffill().dropna()
         df_15["returns"] = df_15["close"].pct_change()
         df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
@@ -410,7 +358,6 @@ class MLService:
         ]
         df_15["signal_target"] = np.select(conditions, [1, 0], default=2)
         df_15.dropna(inplace=True)
-        # Automated Feature Selection using RandomForest
         for col in self.signal_feature_cols:
             if col not in df_15.columns:
                 df_15[col] = 0.0
@@ -419,20 +366,7 @@ class MLService:
         features_scaled = scaler.fit_transform(features_all)
         features_all = pd.DataFrame(features_scaled, index=features_all.index, columns=self.signal_feature_cols)
         signal_labels = df_15["signal_target"].astype(np.int32).values
-        rf = RandomForestClassifier(n_estimators=100, random_state=42)
-        rf.fit(features_all, signal_labels)
-        importances = rf.feature_importances_
-        median_importance = np.median(importances)
-        selected_indices = np.where(importances >= median_importance)[0]
-        selected_features = [self.signal_feature_cols[i] for i in selected_indices]
-        logger.info("Selected features for signal model:", selected_features=selected_features)
-        self.actual_signal_cols = selected_features
-
-        scaler = RobustScaler()
-        df_15[self.actual_signal_cols] = scaler.fit_transform(df_15[self.actual_signal_cols])
-        features = df_15[self.actual_signal_cols].values
-        signal_labels = df_15["signal_target"].astype(np.int32).values
-        X, y = self._make_sequences(features, signal_labels, self.lookback)
+        X, y = self._make_sequences(features_all.values, signal_labels, self.lookback)
         if len(X) < 1:
             logger.warning("Not enough data after sequence creation for tuning signal model.")
             return
@@ -448,22 +382,26 @@ class MLService:
             directory="kt_dir",
             project_name="signal_model_tuning"
         )
-        await asyncio.to_thread(lambda: tuner.search(
-            X_train, to_categorical(y_train, num_classes=3),
-            validation_data=(X_val, to_categorical(y_val, num_classes=3)),
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            callbacks=[EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)],
-            verbose=0
-        ))
+        def run_tuner_search():
+            tuner.search(
+                X_train, to_categorical(y_train, num_classes=3),
+                validation_data=(X_val, to_categorical(y_val, num_classes=3)),
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                callbacks=[EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)],
+                verbose=0
+            )
+        await asyncio.to_thread(run_tuner_search)
         best_hp = tuner.get_best_hyperparameters(num_trials=1)[0]
         logger.info("Signal tuning complete. Best hyperparameters found:", best_hp.values)
         best_model = self.build_signal_model_tuner(best_hp)
-        cv_loss = walk_forward_validation(X_train, to_categorical(y_train, num_classes=3),
-                                          lambda: self.build_signal_model_tuner(best_hp), num_folds=3)
+        cv_loss = walk_forward_validation(
+            X_train, to_categorical(y_train, num_classes=3),
+            lambda: self.build_signal_model_tuner(best_hp), num_folds=3
+        )
         logger.info("Signal model CV loss", cv_loss=cv_loss)
         if self.use_tuned_signal_model:
-            self.signal_models = [best_model]  # Using tuned model as the ensemble (can be expanded)
+            self.signal_models = [best_model]
             best_model.save("signal_model.keras")
             self.signal_model_ready = True
         return best_model
@@ -536,7 +474,6 @@ class MLService:
         df_15["cmf"] = ta.volume.ChaikinMoneyFlowIndicator(
             high=df_15["high"], low=df_15["low"], close=df_15["close"],
             volume=df_15["volume"], window=20).chaikin_money_flow()
-
         df_15["future_return"] = (df_15["close"].shift(-self.signal_horizon) / df_15["close"]) - 1
         df_15["future_return_smooth"] = df_15["future_return"].rolling(window=3, min_periods=1).mean()
         conditions = [
@@ -545,19 +482,15 @@ class MLService:
         ]
         df_15["signal_target"] = np.select(conditions, [1, 0], default=2)
         df_15.dropna(inplace=True)
-
         logger.info("Signal label distribution", distribution=collections.Counter(df_15["signal_target"]))
         for col in self.signal_feature_cols:
             if col not in df_15.columns:
                 df_15[col] = 0.0
         self.actual_signal_cols = self.signal_feature_cols
-
         scaler = RobustScaler()
         df_15[self.actual_signal_cols] = scaler.fit_transform(df_15[self.actual_signal_cols])
-
         features = df_15[self.actual_signal_cols].values
         signal_labels = df_15["signal_target"].astype(np.int32).values
-
         X, y = self._make_sequences(features, signal_labels, self.lookback)
         if len(X) < 1:
             logger.warning("Not enough data after sequence creation for signal ensemble.")
@@ -574,12 +507,10 @@ class MLService:
             return flat_pca.reshape(X.shape[0], X.shape[1], -1)
         X_val = apply_pca(X_val)
         X_test = apply_pca(X_test)
-
         unique = np.unique(y_train)
         cw = compute_class_weight("balanced", classes=unique, y=y_train)
         cw_dict = dict(zip(unique, cw))
         sample_weights = np.array([cw_dict[label] for label in y_train])
-
         self.signal_models = []
         for i in range(n_models):
             input_shape = (X_train.shape[1], X_train.shape[2])
@@ -597,7 +528,7 @@ class MLService:
             self.signal_models.append(model)
         preds = [model.predict(X_test) for model in self.signal_models]
         avg_preds = np.mean(np.array(preds), axis=0)
-        y_pred_class = np.argmax(avg_preds, axis=1)
+        y_pred_class = np.argmax(avg_preds, axis=1)[0]
         cm = confusion_matrix(y_test, y_pred_class)
         f1 = f1_score(y_test, y_pred_class, average="weighted")
         logger.info("Signal Ensemble Evaluation", confusion_matrix=cm.tolist(), weighted_f1=f1)
@@ -638,11 +569,10 @@ class MLService:
 
     def predict_trend(self, recent_data: pd.DataFrame) -> str:
         if self.trend_model:
-            # Use 15-minute bars for trend prediction for faster reaction
             data_seq = self._prepare_data_sequence(recent_data, self.actual_trend_cols or self.trend_feature_cols, resample_period="15min")
             if data_seq is None:
                 return "Hold"
-            preds = self.ml_service.trend_model.predict(data_seq)
+            preds = self.trend_model.predict(data_seq)
             trend_class = np.argmax(preds, axis=1)[0]
             trend_label = {0: "Uptrending", 1: "Downtrending", 2: "Sideways"}.get(trend_class, "Sideways")
             return trend_label
@@ -663,7 +593,3 @@ class MLService:
         else:
             logger.warning("No signal model ensemble available; returning 'Hold'.")
             return "Hold"
-
-    async def stop(self):
-        self.running = False
-        logger.info("TradeService stopped.")

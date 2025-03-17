@@ -44,7 +44,14 @@ services:
     volumes:
       - ./model_storage:/app/model_storage
     restart: unless-stopped
-    
+
+    # --- Added log rotation settings for the trader-app container:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   timescaledb-data:
 

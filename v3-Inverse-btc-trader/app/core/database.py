@@ -1,4 +1,4 @@
-# File: app/core/database.py
+# File: v2-Inverse-btc-trader/app/core/database.py
 
 import asyncio
 import asyncpg
@@ -8,14 +8,21 @@ from app.core.config import Config
 logger = get_logger(__name__)
 
 class Database:
-    _pool = None
+    """
+    Manages the asyncpg connection pool and provides high-level DB operations.
+    Creates TimescaleDB hypertables for market_data, trades, candles.
+    """
 
-    _max_retries = 10
-    _base_delay = 3
+    _pool = None
+    _max_retries = 5
+    _base_delay = 2
 
     @classmethod
-    async def initialize(cls):
-        """Initialize the database connection pool and create tables."""
+    async def initialize(cls) -> None:
+        """
+        Initialize the database connection pool and create tables.
+        Includes retry logic and TimescaleDB hypertable creation.
+        """
         for attempt in range(cls._max_retries):
             try:
                 logger.info(f"Database connection attempt {attempt+1}/{cls._max_retries}")
@@ -27,7 +34,6 @@ class Database:
                 )
 
                 async with cls._pool.acquire() as conn:
-                    # Create TimescaleDB extension if not present
                     await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;')
 
                     # market_data table
@@ -81,60 +87,56 @@ class Database:
                         );
                     ''')
 
-                    # -----------------------------------------------------------
-                    # REMOVE add_retention_policy call. We do not want to re-add
-                    # the policy every time. If it already exists, Timescale tries
-                    # to run it, leading to deadlock during backfill.
-                    #
-                    # Instead, do it once manually:
-                    #   SELECT add_retention_policy('candles', INTERVAL '30 days');
-                    #
-                    # Or handle it with a separate init/migration script.
-                    # -----------------------------------------------------------
-
                 logger.info("Database initialized successfully")
                 return
             except Exception as e:
-                logger.error("Database connection failed", error=str(e))
-                backoff = cls._base_delay ** attempt
-                await asyncio.sleep(backoff)
-
-        logger.error("All DB connection attempts failed. Check logs for DNS or Postgres issues.")
+                logger.error("Database connection failed", attempt=attempt+1, error=str(e))
+                await asyncio.sleep(cls._base_delay ** attempt)
 
     @classmethod
-    async def close(cls):
-        """Close the database connection pool."""
+    async def close(cls) -> None:
+        """
+        Close the database connection pool.
+        """
         if cls._pool:
             await cls._pool.close()
             logger.info("Database connection pool closed")
 
     @classmethod
-    async def execute(cls, query, *args):
-        """Execute a SQL command and return status."""
+    async def execute(cls, query: str, *args) -> str:
+        """
+        Execute a SQL command and return status.
+        """
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.execute(query, *args)
 
     @classmethod
-    async def fetch(cls, query, *args):
-        """Fetch multiple rows."""
+    async def fetch(cls, query: str, *args):
+        """
+        Fetch multiple rows.
+        """
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetch(query, *args)
 
     @classmethod
-    async def fetchrow(cls, query, *args):
-        """Fetch a single row."""
+    async def fetchrow(cls, query: str, *args):
+        """
+        Fetch a single row.
+        """
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
     @classmethod
-    async def fetchval(cls, query, *args):
-        """Fetch a single value."""
+    async def fetchval(cls, query: str, *args):
+        """
+        Fetch a single value.
+        """
         if not cls._pool:
             raise RuntimeError("Database not initialized. Call Database.initialize() first.")
         async with cls._pool.acquire() as conn:
