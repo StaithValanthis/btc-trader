@@ -1,4 +1,4 @@
-# File: app/services/trade_service.py
+# trade_service.py
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ta.trend")
@@ -6,7 +6,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="ta.trend")
 import asyncio
 import math
 import json
-import gc
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -17,16 +16,16 @@ from pybit.unified_trading import HTTP
 from structlog import get_logger
 
 from app.core import Database, Config
-from app.services.ml_service import MLService, calculate_dmi  # Import calculate_dmi here
+from app.services.ml_service import MLService
 from app.services.backfill_service import maybe_backfill_candles
 from app.utils.cache import redis_client
 
 logger = get_logger(__name__)
 
-
 def enhanced_get_market_regime(df, adx_period=14, base_threshold=25):
     """
-    Determines market regime based on ADX, SMA crossover and volatility.
+    Determines the market regime (uptrending, downtrending, sideways)
+    by referencing ADX, MAs, and volatility.
     """
     try:
         df_clean = df[["high", "low", "close"]].ffill().dropna()
@@ -36,10 +35,8 @@ def enhanced_get_market_regime(df, adx_period=14, base_threshold=25):
             return "sideways"
 
         adx_indicator = ta.trend.ADXIndicator(
-            high=df_clean["high"],
-            low=df_clean["low"],
-            close=df_clean["close"],
-            window=adx_period
+            high=df_clean["high"], low=df_clean["low"],
+            close=df_clean["close"], window=adx_period
         )
         adx_series = adx_indicator.adx().dropna()
         latest_adx = adx_series.iloc[-1] if not adx_series.empty else 0
@@ -50,23 +47,19 @@ def enhanced_get_market_regime(df, adx_period=14, base_threshold=25):
         ma_trend = "up" if sma_diff > 0 else "down"
 
         atr_indicator = ta.volatility.AverageTrueRange(
-            high=df_clean["high"],
-            low=df_clean["low"],
-            close=df_clean["close"],
-            window=14
+            high=df_clean["high"], low=df_clean["low"],
+            close=df_clean["close"], window=14
         )
         atr_series = atr_indicator.average_true_range().dropna()
         atr_percentile = atr_series.rank(pct=True).iloc[-1] if not atr_series.empty else 0
 
-        adaptive_threshold = base_threshold * (1 - 0.2 * atr_percentile)
-
         boll = ta.volatility.BollingerBands(
-            close=df_clean["close"],
-            window=20,
-            window_dev=2
+            close=df_clean["close"], window=20, window_dev=2
         )
         bb_width = boll.bollinger_wband()
         bb_width_percentile = bb_width.rank(pct=True).iloc[-1] if not bb_width.empty else 0
+
+        adaptive_threshold = base_threshold * (1 - 0.2 * atr_percentile)
 
         if latest_adx > adaptive_threshold:
             if ma_trend == "up" and df_clean['close'].iloc[-1] > df_clean['SMA20'].iloc[-1]:
@@ -96,11 +89,18 @@ def enhanced_get_market_regime(df, adx_period=14, base_threshold=25):
 
 
 class TradeService:
-    def __init__(self):
-        self.ml_service = MLService(lookback=60, ensemble_size=3)
+    def __init__(self, symbol):
+        self.symbol = symbol
+        self.ml_service = MLService(
+            symbol,
+            lookback=60,
+            ensemble_size=3,
+            use_tuned_trend_model=True,
+            use_tuned_signal_model=True
+        )
         self.session = None
-        self.min_qty = None  # Minimum order size (in contracts)
-        self.current_position = None  # "buy" or "sell"
+        self.min_qty = None
+        self.current_position = None
         self.current_order_qty = None
         self.last_trade_time = None
         self.running = False
@@ -115,8 +115,9 @@ class TradeService:
                 recv_window=5000
             )
             await self._get_min_order_qty()
+
             await self.ml_service.initialize()
-            logger.info("Trade service initialized successfully")
+            logger.info(f"Trade service for {self.symbol} initialized successfully")
         except Exception as e:
             logger.critical("Fatal error initializing trade service", error=str(e))
             raise
@@ -131,17 +132,17 @@ class TradeService:
             info = await asyncio.to_thread(
                 self.session.get_instruments_info,
                 category=Config.BYBIT_CONFIG.get('category', 'inverse'),
-                symbol=Config.TRADING_CONFIG['symbol']
+                symbol=self.symbol
             )
             self.min_qty = float(info['result']['list'][0]['lotSizeFilter']['minOrderQty'])
-            logger.info("Loaded min order qty", min_qty=self.min_qty)
+            logger.info("Loaded min order qty", min_qty=self.min_qty, symbol=self.symbol)
 
     async def check_open_trade(self) -> bool:
         try:
             pos_data = await asyncio.to_thread(
                 self.session.get_positions,
                 category=Config.BYBIT_CONFIG.get('category', 'inverse'),
-                symbol=Config.TRADING_CONFIG['symbol']
+                symbol=self.symbol
             )
             if pos_data.get("retCode", -1) != 0:
                 logger.error("Failed to fetch positions", data=pos_data)
@@ -149,25 +150,17 @@ class TradeService:
             positions = pos_data["result"].get("list", [])
             for pos in positions:
                 if float(pos.get("size", "0")) != 0:
-                    logger.info("Open position detected", size=pos.get("size"))
+                    logger.info("Open position detected", size=pos.get("size"), symbol=self.symbol)
                     return True
             return False
         except Exception as e:
-            logger.error("Error checking open trade", error=str(e))
+            logger.error("Error checking open trade", error=str(e), symbol=self.symbol)
             return False
 
-    def calculate_best_leverage(self, current_price: float, atr_value: float) -> float:
-        vol_ratio = abs(atr_value) / current_price
-        if vol_ratio >= 0.02:
-            leverage = 1.0
-        elif vol_ratio <= 0.005:
-            leverage = 20.0
-        else:
-            leverage = 20.0 - ((vol_ratio - 0.005) / 0.015) * (20.0 - 1.0)
-        return round(leverage, 2)
-
-    def compute_adaptive_stop_loss_and_risk(self, current_price: float, atr_value: float, signal: str,
-                                            market_regime: str, df_features: dict, base_risk_multiplier=1.5) -> (float, float):
+    def compute_adaptive_stop_loss_and_risk(self, current_price: float, atr_value: float,
+                                            signal: str, market_regime: str,
+                                            df_features: dict,
+                                            base_risk_multiplier=1.5) -> (float, float):
         raw_risk = base_risk_multiplier * abs(atr_value)
         risk = min(raw_risk, 0.10 * current_price)
         if signal.lower() == "buy":
@@ -178,9 +171,10 @@ class TradeService:
             stop_loss = current_price
         return stop_loss, risk
 
-    def compute_sl_tp_dynamic(self, current_price: float, atr_value: float, signal: str,
-                              market_regime: str, df_features: dict, base_risk_multiplier=1.5,
-                              min_reward_risk_ratio=2.0) -> (float, float):
+    def compute_sl_tp_dynamic(self, current_price: float, atr_value: float,
+                              signal: str, market_regime: str,
+                              df_features: dict,
+                              base_risk_multiplier=1.5, min_reward_risk_ratio=2.0) -> (float, float):
         stop_loss, risk = self.compute_adaptive_stop_loss_and_risk(
             current_price, atr_value, signal, market_regime, df_features, base_risk_multiplier
         )
@@ -197,38 +191,18 @@ class TradeService:
         return stop_loss, take_profit
 
     async def update_trade_stops(self, stop_loss: float, take_profit: float):
+        params = {
+            "category": Config.BYBIT_CONFIG.get("category", "inverse"),
+            "symbol": self.symbol,
+            "stopLoss": str(stop_loss),
+            "takeProfit": str(take_profit),
+            "positionIdx": 0
+        }
         try:
-            pos_data = await asyncio.to_thread(
-                self.session.get_positions,
-                category=Config.BYBIT_CONFIG.get('category', 'inverse'),
-                symbol=Config.TRADING_CONFIG['symbol']
-            )
-            positions = pos_data["result"].get("list", [])
-            open_size = 0.0
-            for pos in positions:
-                size_val = float(pos.get("size", "0"))
-                if size_val != 0:
-                    open_size = size_val
-                    break
-            if open_size <= 0:
-                logger.warning("No open position found; skipping stopLoss/takeProfit update.")
-                return
-
-            params = {
-                "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-                "symbol": Config.TRADING_CONFIG['symbol'],
-                "stopLoss": str(stop_loss),
-                "takeProfit": str(take_profit),
-                "positionIdx": 0
-            }
             response = await asyncio.to_thread(self.session.set_trading_stop, **params)
-            ret_code = response.get("retCode", -1)
-            if ret_code == 0:
-                logger.info("Trade stops updated", data=response)
-            else:
-                logger.error("Error updating trade stops", data=response)
+            logger.info("Trade stops updated", data=response, symbol=self.symbol)
         except Exception as e:
-            logger.error("Exception in update_trade_stops", error=str(e))
+            logger.error("Error updating trade stops", error=str(e))
 
     async def update_open_trade_stops_task(self):
         while self.running:
@@ -236,56 +210,65 @@ class TradeService:
                 try:
                     recent_df = await self.get_recent_candles()
                     recent_df = recent_df.asfreq('1min')
-                    df_5 = recent_df.resample('5min').agg({
+                    df_15 = recent_df.resample('15min').agg({
                         'open': 'first',
                         'high': 'max',
                         'low': 'min',
                         'close': 'last',
                         'volume': 'sum'
                     }).ffill().dropna()
-                    if len(df_5) < 14:
-                        logger.warning("Not enough 5-minute data for updating trade stops.")
+                    if len(df_15) < 14:
+                        logger.warning("Not enough 15-minute data for updating trade stops.", symbol=self.symbol)
                         await asyncio.sleep(60)
                         continue
 
-                    df_5["rsi"] = ta.momentum.rsi(df_5["close"], window=14).ffill()
-                    macd = ta.trend.MACD(close=df_5["close"], window_slow=26, window_fast=12, window_sign=9)
-                    df_5["macd"] = macd.macd()
-                    df_5["macd_diff"] = macd.macd_diff().ffill()
-                    boll = ta.volatility.BollingerBands(close=df_5["close"], window=20, window_dev=2)
-                    df_5["bb_high"] = boll.bollinger_hband()
-                    df_5["bb_low"] = boll.bollinger_lband()
-                    df_5["bb_mavg"] = boll.bollinger_mavg()
+                    df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14).ffill()
+                    macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
+                    df_15["macd"] = macd.macd()
+                    df_15["macd_diff"] = macd.macd_diff().ffill()
+
+                    boll = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
+                    df_15["bb_high"] = boll.bollinger_hband()
+                    df_15["bb_low"] = boll.bollinger_lband()
+                    df_15["bb_mavg"] = boll.bollinger_mavg()
+
                     atr_indicator = ta.volatility.AverageTrueRange(
-                        high=df_5["high"], low=df_5["low"], close=df_5["close"], window=14)
-                    df_5["atr"] = atr_indicator.average_true_range()
-                    last_candle = df_5.iloc[-1]
-                    boll_temp = ta.volatility.BollingerBands(close=df_5["close"], window=20, window_dev=2)
+                        high=df_15["high"], low=df_15["low"], close=df_15["close"], window=14
+                    )
+                    df_15["atr"] = atr_indicator.average_true_range()
+
+                    boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
                     bb_width = boll_temp.bollinger_wband()
                     bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0.5
                     features = {
-                        "rsi": last_candle["rsi"],
-                        "macd_diff": last_candle["macd_diff"],
+                        "rsi": df_15["rsi"].iloc[-1],
+                        "macd_diff": df_15["macd_diff"].iloc[-1],
                         "bb_width_percentile": bb_width_percentile
                     }
-                    market_regime = enhanced_get_market_regime(df_5)
+                    market_regime = enhanced_get_market_regime(df_15)
                     current_price = recent_df.iloc[-1]["close"]
                     stop_loss, take_profit = self.compute_sl_tp_dynamic(
-                        current_price, df_5["atr"].iloc[-1], self.current_position, market_regime, features, base_risk_multiplier=1.5
+                        current_price, df_15["atr"].iloc[-1],
+                        self.current_position, market_regime, features,
+                        base_risk_multiplier=1.5
                     )
                     await self.update_trade_stops(stop_loss, take_profit)
-                    logger.info("Updated open trade stops", stop_loss=stop_loss, take_profit=take_profit)
+                    logger.info("Updated open trade stops", stop_loss=stop_loss,
+                                take_profit=take_profit, symbol=self.symbol)
                 except Exception as e:
-                    logger.error("Error updating open trade stops", error=str(e))
+                    logger.error("Error updating open trade stops", error=str(e), symbol=self.symbol)
             await asyncio.sleep(60)
 
     async def run_trading_logic(self):
+        # Wait for ML models to be ready
         while not (self.ml_service.trend_model_ready and self.ml_service.signal_model_ready):
-            logger.info("ML models not ready, waiting before evaluating trade signal.")
+            logger.info("ML models not ready, waiting before evaluating trade signal.", symbol=self.symbol)
             await asyncio.sleep(10)
+
         while self.running:
             try:
-                cached = redis_client.get("recent_candles")
+                redis_key = f"recent_candles_{self.symbol}"
+                cached = redis_client.get(redis_key)
                 if cached:
                     data = json.loads(cached)
                     df_1min = pd.DataFrame(data)
@@ -296,93 +279,102 @@ class TradeService:
                     rows = await Database.fetch("""
                         SELECT time, open, high, low, close, volume
                         FROM candles
+                        WHERE symbol=$1
                         ORDER BY time DESC
                         LIMIT 1800
-                    """)
+                    """, self.symbol)
                     if not rows or len(rows) < 60:
-                        logger.warning("Not enough 1-minute candle data for prediction yet.")
+                        logger.warning("Not enough 1-minute candle data for prediction yet.", symbol=self.symbol)
                         await asyncio.sleep(60)
                         continue
                     df_1min = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
                     df_1min['time'] = pd.to_datetime(df_1min['time'])
                     df_1min.sort_values("time", inplace=True)
                     df_1min.set_index("time", inplace=True)
-                    redis_client.setex("recent_candles", 60, df_1min.reset_index().to_json(orient="records"))
+                    redis_client.setex(redis_key, 60, df_1min.reset_index().to_json(orient="records"))
+
                 df_1min = df_1min.asfreq('1min')
-                df_5 = df_1min.resample('5min').agg({
+                df_15 = df_1min.resample('15min').agg({
                     'open': 'first',
                     'high': 'max',
                     'low': 'min',
                     'close': 'last',
                     'volume': 'sum'
                 }).ffill().dropna()
-                if len(df_5) < 14:
-                    logger.warning("Not enough 5-minute candle data for ML prediction.")
+                if len(df_15) < 14:
+                    logger.warning("Not enough 15-minute candle data for ML prediction.", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
+
                 atr_indicator = ta.volatility.AverageTrueRange(
-                    high=df_5["high"], low=df_5["low"], close=df_5["close"], window=14
+                    high=df_15["high"], low=df_15["low"], close=df_15["close"], window=14
                 )
-                df_5["atr"] = atr_indicator.average_true_range()
-                df_5["rsi"] = ta.momentum.rsi(df_5["close"], window=14).ffill()
-                macd = ta.trend.MACD(close=df_5["close"], window_slow=26, window_fast=12, window_sign=9)
-                df_5["macd_diff"] = macd.macd_diff().ffill()
-                market_regime = enhanced_get_market_regime(df_5)
-                logger.info("Market regime detected", regime=market_regime)
+                df_15["atr"] = atr_indicator.average_true_range()
+                df_15["rsi"] = ta.momentum.rsi(df_1min["close"], window=14).ffill()
+                macd = ta.trend.MACD(close=df_15["close"], window_slow=26, window_fast=12, window_sign=9)
+                df_15["macd_diff"] = macd.macd_diff().ffill()
+
+                market_regime = enhanced_get_market_regime(df_15)
+                logger.info("Market regime detected", regime=market_regime, symbol=self.symbol)
                 if market_regime.lower() == "sideways":
-                    logger.info("Market is sideways. Skipping trade entry.")
+                    logger.info("Market is sideways. Skipping trade entry.", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
-                trend_prediction = self.predict_trend(df_5)
-                signal_prediction = self.predict_signal(df_5)
-                logger.info("Trend prediction", trend=trend_prediction)
-                logger.info("5-minute signal prediction", signal=signal_prediction)
+
+                # Predict
+                trend_prediction = self.ml_service.predict_trend(df_15)
+                signal_prediction = self.ml_service.predict_signal(df_15)
+                logger.info("Trend prediction", trend=trend_prediction, symbol=self.symbol)
+                logger.info("15-minute signal prediction", signal=signal_prediction, symbol=self.symbol)
+
+                # Confluence check
                 if trend_prediction.lower() == "uptrending" and signal_prediction.lower() != "buy":
-                    logger.info("Trend and signal not in confluence (expected Buy). Holding trade.")
+                    logger.info("Trend not matching signal=Buy => skip", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
                 if trend_prediction.lower() == "downtrending" and signal_prediction.lower() != "sell":
-                    logger.info("Trend and signal not in confluence (expected Sell). Holding trade.")
+                    logger.info("Trend not matching signal=Sell => skip", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
+
                 signal = signal_prediction
                 if await self.check_open_trade():
-                    if self.current_position is not None and self.current_position.lower() != signal.lower():
-                        logger.info("Signal reversal detected. Exiting current trade before new trade.")
+                    if self.current_position and self.current_position.lower() != signal.lower():
+                        logger.info("Signal reversal => Exiting current trade", symbol=self.symbol)
                         await self.exit_trade()
                         await asyncio.sleep(1)
                     else:
-                        logger.info("Existing position matches new signal; skipping new trade.")
+                        logger.info("Existing position matches new signal => skip new trade", symbol=self.symbol)
                         await asyncio.sleep(60)
                         continue
                 else:
                     self.current_position = None
                     self.current_order_qty = None
+
                 current_price = df_1min.iloc[-1]["close"]
-                atr_value = df_5["atr"].iloc[-1]
+                atr_value = df_15["atr"].iloc[-1]
                 if atr_value <= 0:
-                    logger.warning("ATR value non-positive, cannot compute position size.")
+                    logger.warning("ATR value non-positive, cannot compute position size", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
                 stop_distance = abs(
                     current_price
                     - self.compute_adaptive_stop_loss_and_risk(
-                        current_price,
-                        atr_value,
-                        signal,
-                        trend_prediction,
-                        {"rsi": df_5["rsi"].iloc[-1], "macd_diff": df_5["macd_diff"].iloc[-1]}
+                        current_price, atr_value, signal, trend_prediction, {"rsi": df_15["rsi"].iloc[-1]}
                     )[0]
                 )
                 if stop_distance == 0:
-                    logger.warning("Stop distance is 0; cannot compute position size.")
+                    logger.warning("Stop distance=0 => cannot compute position size", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
+
                 portfolio_value = await self.get_portfolio_value()
                 if portfolio_value <= 0:
-                    logger.warning("Portfolio value is 0; cannot size position.")
+                    logger.warning("Portfolio value=0 => cannot size position", symbol=self.symbol)
                     await asyncio.sleep(60)
                     continue
+
+                # Basic risk-based sizing
                 risk_per_trade = 0.01 * portfolio_value
                 computed_qty = (risk_per_trade / stop_distance) * current_price
                 order_qty = max(computed_qty, self.min_qty)
@@ -392,15 +384,18 @@ class TradeService:
                             risk_per_trade=risk_per_trade,
                             stop_distance=stop_distance,
                             computed_qty=computed_qty,
-                            final_qty=order_qty)
+                            final_qty=order_qty,
+                            symbol=self.symbol)
                 fixed_leverage = 1
                 await self.set_trade_leverage(fixed_leverage)
-                boll_temp = ta.volatility.BollingerBands(close=df_5["close"], window=20, window_dev=2)
+
+                # Additional features
+                boll_temp = ta.volatility.BollingerBands(close=df_15["close"], window=20, window_dev=2)
                 bb_width = boll_temp.bollinger_wband()
                 bb_width_percentile = (bb_width.rank(pct=True).iloc[-1]) if not bb_width.empty else 0.5
                 features = {
-                    "rsi": df_5["rsi"].iloc[-1],
-                    "macd_diff": df_5["macd_diff"].iloc[-1],
+                    "rsi": df_15["rsi"].iloc[-1],
+                    "macd_diff": df_15["macd_diff"].iloc[-1],
                     "bb_width_percentile": bb_width_percentile
                 }
                 stop_loss, take_profit = self.compute_sl_tp_dynamic(
@@ -416,17 +411,18 @@ class TradeService:
                 self.last_trade_time = datetime.now(timezone.utc)
                 self.current_position = signal.lower()
                 self.current_order_qty = order_qty
+
             except Exception as e:
-                logger.error("Error in trading logic", error=str(e))
+                logger.error("Error in trading logic", error=str(e), symbol=self.symbol)
             await asyncio.sleep(60)
 
     async def exit_trade(self):
-        if self.current_position is None:
-            logger.warning("No current position to exit.")
+        if not self.current_position:
+            logger.warning("No current position to exit", symbol=self.symbol)
             return
         exit_side = "Sell" if self.current_position.lower() == "buy" else "Buy"
-        order_qty = self.current_order_qty if self.current_order_qty is not None else self.min_qty
-        logger.info("Exiting trade", exit_side=exit_side, qty=order_qty)
+        order_qty = self.current_order_qty if self.current_order_qty else self.min_qty
+        logger.info("Exiting trade", exit_side=exit_side, qty=order_qty, symbol=self.symbol)
         await self.execute_trade(
             side=exit_side,
             qty=str(order_qty),
@@ -438,26 +434,21 @@ class TradeService:
         self.current_order_qty = None
         self.scaled_in = False
 
-    async def scale_in_trade(self, side: str, additional_qty: int, delay: int = 60):
+    async def scale_in_trade(self, side: str, additional_qty: int, delay: int=60):
         await asyncio.sleep(delay)
         recent_df = await self.get_recent_candles()
-        new_signal = self.predict_signal(recent_df)
+        new_signal = self.ml_service.predict_signal(recent_df)
         if new_signal.lower() == side.lower():
-            logger.info("Scaling in additional position", side=side, additional_qty=additional_qty)
-            await self.execute_trade(
-                side=side,
-                qty=str(additional_qty),
-                stop_loss=None,
-                take_profit=None,
-                leverage="1"
-            )
+            logger.info("Scaling in additional position", side=side, additional_qty=additional_qty, symbol=self.symbol)
+            await self.execute_trade(side=side, qty=str(additional_qty))
             self.scaled_in = True
         else:
-            logger.info("Market conditions not favorable for scaling in")
+            logger.info("Market conditions not favorable for scaling in", symbol=self.symbol)
 
     async def get_recent_candles(self):
-        MIN_REQUIRED = 210  # Approximately 3.5 hours of 1-minute candles
-        cached = redis_client.get("recent_candles")
+        MIN_REQUIRED = 210
+        redis_key = f"recent_candles_{self.symbol}"
+        cached = redis_client.get(redis_key)
         if cached:
             data = json.loads(cached)
             df = pd.DataFrame(data)
@@ -465,9 +456,10 @@ class TradeService:
                 rows = await Database.fetch("""
                     SELECT time, open, high, low, close, volume
                     FROM candles
+                    WHERE symbol=$1
                     ORDER BY time DESC
                     LIMIT 1800
-                """)
+                """, self.symbol)
                 df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
                 if not df.empty:
                     df['time'] = pd.to_datetime(df['time'])
@@ -481,9 +473,10 @@ class TradeService:
             rows = await Database.fetch("""
                 SELECT time, open, high, low, close, volume
                 FROM candles
+                WHERE symbol=$1
                 ORDER BY time DESC
                 LIMIT 1800
-            """)
+            """, self.symbol)
             df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
             if not df.empty:
                 df['time'] = pd.to_datetime(df['time'])
@@ -497,7 +490,7 @@ class TradeService:
                 self.session.get_wallet_balance,
                 accountType="UNIFIED"
             )
-            logger.info("Wallet balance data", data=balance_data)
+            logger.info("Wallet balance data", data=balance_data, symbol=self.symbol)
             total_balance = 0.0
             account_list = balance_data["result"].get("list", [])
             if not account_list:
@@ -509,55 +502,56 @@ class TradeService:
                     total_balance += usd_val
             return total_balance
         except Exception as e:
-            logger.error("Failed to fetch portfolio value", error=str(e))
+            logger.error("Failed to fetch portfolio value", error=str(e), symbol=self.symbol)
             return 0.0
 
     async def _log_trade(self, side: str, qty: str):
         if Database._pool is None:
-            logger.warning("Database is closed; skipping trade logging.")
+            logger.warning("Database is closed; skipping trade logging.", symbol=self.symbol)
             return
         try:
             await Database.execute('''
-                INSERT INTO trades (time, side, price, quantity)
-                VALUES ($1, $2, $3, $4)
-            ''', datetime.now(timezone.utc), side, 0, float(qty))
+                INSERT INTO trades (symbol, time, side, price, quantity)
+                VALUES ($1, $2, $3, $4, $5)
+            ''', self.symbol, datetime.now(timezone.utc), side, 0, float(qty))
         except Exception as e:
-            logger.error("Failed to log trade", error=str(e))
+            logger.error("Failed to log trade", error=str(e), symbol=self.symbol)
 
     async def set_trade_leverage(self, leverage: int):
         if Config.BYBIT_CONFIG.get("category", "inverse") == "inverse":
-            logger.info("Skipping set_leverage for inverse contracts")
+            logger.info("Skipping set_leverage for inverse contracts", symbol=self.symbol)
             return
         try:
             response = await asyncio.to_thread(
                 self.session.set_leverage,
                 category=Config.BYBIT_CONFIG.get("category", "inverse"),
-                symbol=Config.TRADING_CONFIG['symbol'],
+                symbol=self.symbol,
                 leverage=str(leverage)
             )
-            logger.info("Set leverage response", data=response)
+            logger.info("Set leverage response", data=response, symbol=self.symbol)
         except Exception as e:
-            logger.error("Error setting leverage", error=str(e))
+            logger.error("Error setting leverage", error=str(e), symbol=self.symbol)
 
     async def execute_trade(self, side: str, qty: str,
-                              stop_loss: float = None,
-                              take_profit: float = None,
-                              leverage: str = None):
+                            stop_loss: float = None,
+                            take_profit: float = None,
+                            leverage: str = None):
         if not self.running:
             return
         if float(qty) < self.min_qty:
             logger.warning("Computed position size below minimum; adjusting to minimum",
-                           required=self.min_qty, actual=qty)
+                           required=self.min_qty, actual=qty, symbol=self.symbol)
             qty = str(self.min_qty)
         logger.info("Placing trade",
                     side=side,
                     size=qty,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
-                    leverage=leverage)
+                    leverage=leverage,
+                    symbol=self.symbol)
         order_params = {
             "category": Config.BYBIT_CONFIG.get("category", "inverse"),
-            "symbol": Config.TRADING_CONFIG['symbol'],
+            "symbol": self.symbol,
             "side": side,
             "orderType": "Market",
             "qty": qty,
@@ -570,138 +564,12 @@ class TradeService:
             response = await asyncio.to_thread(self.session.place_order, **order_params)
             if response['retCode'] == 0:
                 await self._log_trade(side, qty)
-                logger.info("Trade executed successfully", order_id=response['result']['orderId'])
+                logger.info("Trade executed successfully",
+                            order_id=response['result']['orderId'],
+                            symbol=self.symbol)
             else:
                 error_msg = response.get('retMsg', 'Unknown error')
-                logger.error("Trade failed", error=error_msg)
+                logger.error("Trade failed", error=error_msg, symbol=self.symbol)
         except Exception as e:
-            logger.error("Trade execution error", error=str(e))
+            logger.error("Trade execution error", error=str(e), symbol=self.symbol)
             self.current_position = None
-
-    def _prepare_data_sequence(self, df: pd.DataFrame, feature_list: list, resample_period: str = '5min') -> np.ndarray:
-        data = df.copy()
-        data = data.asfreq('1min')
-        df_resampled = data.resample(resample_period).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).ffill().dropna()
-        for col in feature_list:
-            if col not in df_resampled.columns:
-                df_resampled[col] = 0.0
-        from sklearn.preprocessing import RobustScaler
-        scaler = RobustScaler()
-        df_resampled[feature_list] = scaler.fit_transform(df_resampled[feature_list])
-        if len(df_resampled) < self.ml_service.lookback:
-            logger.warning("Not enough bars for inference.", current_rows=len(df_resampled))
-            return None
-        recent_slice = df_resampled.tail(self.ml_service.lookback).copy()
-        if len(recent_slice) < self.ml_service.lookback:
-            missing = self.ml_service.lookback - len(recent_slice)
-            pad_df = pd.DataFrame([recent_slice.iloc[0].values] * missing, columns=recent_slice.columns)
-            recent_slice = pd.concat([pad_df, recent_slice], ignore_index=True)
-        seq = recent_slice[feature_list].values
-        seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        if self.ml_service.pca is not None:
-            flat_seq = seq.reshape(-1, seq.shape[1])
-            flat_seq = self.ml_service.pca.transform(flat_seq)
-            seq = flat_seq.reshape(seq.shape[0], -1)
-        seq = np.expand_dims(seq, axis=0)
-        return seq
-
-    def predict_trend(self, recent_data: pd.DataFrame) -> str:
-        if self.ml_service.trend_model:
-            df = recent_data.copy().asfreq("1min")
-            df_10 = df.resample("10min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum"
-            }).ffill()
-            df_20 = df.resample("20min").agg({
-                "open": "first", "high": "max", "low": "min",
-                "close": "last", "volume": "sum"
-            }).ffill()
-            if len(df_10) < self.ml_service.lookback or len(df_20) < self.ml_service.lookback:
-                logger.warning("Not enough 10min or 20min data for trend inference.")
-                return "Hold"
-            df_20_aligned = df_20.reindex(df_10.index, method="ffill")
-            for temp_df in [df_10, df_20_aligned]:
-                temp_df["sma20"] = temp_df["close"].rolling(window=20, min_periods=1).mean()
-                temp_df["sma50"] = temp_df["close"].rolling(window=50, min_periods=1).mean()
-                temp_df["sma_diff"] = temp_df["sma20"] - temp_df["sma50"]
-                temp_df["adx"] = ta.trend.ADXIndicator(
-                    high=temp_df["high"], low=temp_df["low"],
-                    close=temp_df["close"], window=14
-                ).adx()
-                try:
-                    dmi, plus_di, minus_di = calculate_dmi(temp_df["high"], temp_df["low"], temp_df["close"], window=14)
-                    temp_df["dmi_diff"] = plus_di - minus_di
-                except Exception as e:
-                    logger.warning("Custom DMI calculation failed in predict_trend", error=str(e))
-                    temp_df["dmi_diff"] = 0.0
-            composite = pd.DataFrame(index=df_10.index)
-            composite["sma_diff"] = (df_10["sma_diff"] + df_20_aligned["sma_diff"]) / 2
-            composite["adx"] = (df_10["adx"] + df_20_aligned["adx"]) / 2
-            composite["dmi_diff"] = (df_10["dmi_diff"] + df_20_aligned["dmi_diff"]) / 2
-            composite.ffill(inplace=True)
-            composite.dropna(inplace=True)
-            if len(composite) < self.ml_service.lookback:
-                logger.warning("Not enough composite rows for trend model lookback.")
-                return "Hold"
-            last_slice = composite.tail(self.ml_service.lookback).copy()
-            from sklearn.preprocessing import RobustScaler
-            used_cols = ["sma_diff", "adx", "dmi_diff"]
-            scaler = RobustScaler()
-            last_slice[used_cols] = scaler.fit_transform(last_slice[used_cols])
-            seq = last_slice[used_cols].values
-            seq = np.nan_to_num(seq, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-            seq = np.expand_dims(seq, axis=0)
-            preds = self.ml_service.trend_model.predict(seq)
-            trend_class = np.argmax(preds, axis=1)[0]
-            trend_label = {0: "Uptrending", 1: "Downtrending", 2: "Sideways"}.get(trend_class, "Sideways")
-            return trend_label
-        else:
-            logger.warning("No trend model available; returning 'Sideways'.")
-            return "Sideways"
-
-    def predict_signal(self, recent_data: pd.DataFrame) -> str:
-        if self.ml_service.signal_models and self.ml_service.signal_model_ready:
-            data_seq = self._prepare_data_sequence(
-                recent_data,
-                self.ml_service.actual_signal_cols or self.ml_service.signal_feature_cols,
-                resample_period="5min"
-            )
-            if data_seq is None:
-                return "Hold"
-            preds = [model.predict(data_seq) for model in self.ml_service.signal_models]
-            avg_pred = np.mean(np.array(preds), axis=0)
-            signal_class = np.argmax(avg_pred, axis=1)[0]
-            signal_label = {0: "Sell", 1: "Buy", 2: "Hold"}.get(signal_class, "Hold")
-            return signal_label
-        else:
-            logger.warning("No signal model ensemble available or not ready; returning 'Hold'.")
-            return "Hold"
-
-    async def stop(self):
-        self.running = False
-        logger.info("TradeService stopped.")
-
-
-# ---------------------
-# Periodic Garbage Collection Task
-# ---------------------
-async def periodic_gc(interval_seconds: int = 300):
-    while True:
-        collected = gc.collect()
-        logger.info("Garbage collection complete", objects_collected=collected)
-        await asyncio.sleep(interval_seconds)
-
-if __name__ == "__main__":
-    async def main():
-        asyncio.create_task(periodic_gc(300))
-        trade_service = TradeService()
-        await trade_service.initialize()
-        while True:
-            await asyncio.sleep(60)
-    asyncio.run(main())

@@ -1,4 +1,3 @@
-# reset_database.py
 import asyncio
 import asyncpg
 from structlog import get_logger
@@ -11,8 +10,6 @@ async def reset_database():
     try:
         conn = await asyncpg.connect(**Config.DB_CONFIG)
         logger.info("Connected to the database")
-
-        # Remove retention/compression policies if they exist
         await conn.execute('''
             SELECT remove_retention_policy('market_data') 
             WHERE EXISTS(
@@ -28,12 +25,10 @@ async def reset_database():
             );
         ''')
         logger.info("Removed retention and compression policies")
-
-        # Drop tables
         await conn.execute('DROP TABLE IF EXISTS market_data;')
         await conn.execute('DROP TABLE IF EXISTS trades;')
+        await conn.execute('DROP TABLE IF EXISTS candles;')
         logger.info("Dropped tables")
-
         logger.info("Database reset complete")
     except Exception as e:
         logger.error("Failed to reset database", error=str(e))

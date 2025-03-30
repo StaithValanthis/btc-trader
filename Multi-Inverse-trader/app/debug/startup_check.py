@@ -1,5 +1,3 @@
-# File: app/debug/startup_check.py
-
 import asyncio
 from structlog import get_logger
 from app.core.config import Config
@@ -11,26 +9,15 @@ logger = get_logger(__name__)
 
 class StartupChecker:
     @classmethod
-    async def run_checks(cls):
-        logger.info("Running startup checks...")
+    async def run_checks(cls, symbol):
+        logger.info(f"Running startup checks for {symbol}...")
         cls._check_env_vars()
-
         if Database._pool is None:
             await Database.initialize()
-
         await cls._check_db_connection()
-        await cls._check_bybit_connection()
-
-        # Automatically backfill candles if fewer than 2000 rows exist.
-        # Updated to fetch 365 days of 1-min candles.
-        await maybe_backfill_candles(
-            min_rows=2000,
-            symbol="BTCUSD",
-            interval=1,
-            days_to_fetch=30
-        )
-
-        logger.info("All startup checks passed")
+        await cls._check_bybit_connection(symbol)
+        await maybe_backfill_candles(symbol=symbol, min_rows=2000, interval=1, days_to_fetch=10)
+        logger.info(f"All startup checks passed for {symbol}")
 
     @classmethod
     def _check_env_vars(cls):
@@ -47,7 +34,7 @@ class StartupChecker:
             raise ConnectionError(f"Database connection failed: {e}")
 
     @classmethod
-    async def _check_bybit_connection(cls):
+    async def _check_bybit_connection(cls, symbol):
         try:
             session = HTTP(
                 testnet=Config.BYBIT_CONFIG['testnet'],
@@ -55,6 +42,6 @@ class StartupChecker:
                 api_secret=Config.BYBIT_CONFIG['api_secret']
             )
             await asyncio.to_thread(session.get_server_time)
-            logger.info("Bybit API connection successful")
+            logger.info(f"Bybit API connection successful for {symbol}")
         except Exception as e:
             raise ConnectionError(f"Bybit API connection failed: {e}")
