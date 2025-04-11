@@ -148,11 +148,30 @@ async def periodic_gc(interval_seconds: int = 300):
         logger.info("Garbage collection complete", objects_collected=collected)
         await asyncio.sleep(interval_seconds)
 
+###############################################################################
+# NEW: Data Repair Function
+###############################################################################
+def repair_candle_row(row):
+    """
+    Repairs a single candle row if the 'close' value is invalid.
+    - If close <= 0, replace with previous valid close.
+    - Clamp close between low and high.
+    """
+    # If close is non-positive, set it to the average of low and high (or use previous valid value)
+    if row["close"] <= 0:
+        row["close"] = (row["low"] + row["high"]) / 2.0
+    # Clamp close to be between low and high
+    row["close"] = max(row["low"], min(row["close"], row["high"]))
+    return row
+
+###############################################################################
+# MLService Class
+###############################################################################
 class MLService:
     """
     Trains an ensemble of trend models using 4h data and a signal model ensemble using 15min data.
-    Extra checks ensure that expected columns (including 'signal_target') are present, 
-    and that shapes are validated to prevent 'negative dimensions are not allowed' errors.
+    The redesigned data pipeline cleans and repairs candle data so that technical indicators,
+    including ATR, are computed on reliable data.
     """
     def __init__(
         self,
@@ -195,9 +214,45 @@ class MLService:
         self.actual_trend_cols = None
         self.actual_signal_cols = None
 
-        self._trend_tuning_data = None
-        self._signal_tuning_data = None
-        self._signal_input_shape = None
+        # Expected input shapes for inference
+        self.trend_input_shape = None  # (lookback, number_of_trend_features)
+        self.signal_input_shape = None  # (lookback, number_of_signal_features)
+
+    def preprocess_dataframe(self, df):
+        df = df.copy()
+        # Convert key columns to float
+        for col in ["open", "high", "low", "close", "volume"]:
+            try:
+                df[col] = df[col].astype(float)
+            except Exception as e:
+                logger.error("Error converting column %s to float: %s", col, str(e))
+        logger.debug("Preprocessing: Stats before reindexing - open(min=%.2f, max=%.2f), high(min=%.2f, max=%.2f), low(min=%.2f, max=%.2f), close(min=%.2f, max=%.2f)",
+                     df["open"].min(), df["open"].max(),
+                     df["high"].min(), df["high"].max(),
+                     df["low"].min(), df["low"].max(),
+                     df["close"].min(), df["close"].max())
+        # Reindex DataFrame to strict 1-minute frequency
+        start = df.index.min()
+        end = df.index.max()
+        expected_minutes = int(((end - start).total_seconds() / 60)) + 1
+        df = df.reindex(pd.date_range(start=start, end=end, freq="1min"))
+        df.sort_index(inplace=True)
+        df.ffill(inplace=True)
+        logger.debug("After reindexing: rows=%d", len(df))
+        for col in ["close", "volume"]:
+            df[col] = exponential_smooth(df[col])
+            df[col] = median_filter(df[col], window=5)
+        df = add_lag_features(df, ["close"], lags=[1])
+        # Repair rows that violate data integrity
+        repaired_df = df.apply(repair_candle_row, axis=1)
+        # Remove any remaining rows with non-positive close
+        valid_df = repaired_df[repaired_df["close"] > 0]
+        dropped = len(df) - len(valid_df)
+        if dropped > 0:
+            logger.warning("Dropped %d rows after repair due to non-positive close.", dropped)
+        if len(valid_df) < 0.8 * expected_minutes:
+            logger.warning("Preprocessed candle data has fewer rows (%d) than expected (%d)", len(valid_df), expected_minutes)
+        return valid_df
 
     async def initialize(self):
         try:
@@ -232,39 +287,6 @@ class MLService:
             logger.info("Retrain cycle complete. Sleeping for 4 hours...")
             await asyncio.sleep(14400)
 
-    async def stop(self):
-        self.running = False
-        logger.info("MLService stopped.")
-
-    def _make_sequences(self, features, labels, lookback):
-        X, y = [], []
-        for i in range(len(features) - lookback):
-            X.append(features[i : i + lookback])
-            y.append(labels[i + lookback])
-        return np.array(X), np.array(y)
-
-    def preprocess_dataframe(self, df):
-        df = df.copy()
-        for col in ["close", "volume"]:
-            df[col] = exponential_smooth(df[col])
-            df[col] = median_filter(df[col], window=5)
-        df = add_lag_features(df, ["close"], lags=[1])
-        return df
-
-    # -------------- Trend Model Methods (Ensemble using 4h data) --------------
-    def _build_trend_model(self, input_shape, num_classes=3, dropout_rate=0.2, lstm_units=64):
-        inputs = Input(shape=input_shape)
-        x = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(inputs)
-        x = Dropout(dropout_rate)(x)
-        x = Bidirectional(LSTM(lstm_units, return_sequences=False))(x)
-        x = Dropout(dropout_rate)(x)
-        outputs = Dense(num_classes, activation='softmax')(x)
-        model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=tf.keras.optimizers.Adam(),
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
-        return model
-
     async def tune_trend_models(self):
         logger.info("Tuning trend models: fetching data...")
         self._trend_tuning_data = await Database.fetch("""
@@ -277,6 +299,7 @@ class MLService:
         df.set_index("time", inplace=True)
         df = df.asfreq("1min")
         df = self.preprocess_dataframe(df)
+        logger.info("Trend data time span: %s to %s", df.index.min(), df.index.max())
         df_4h = df.resample("4h").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum"
@@ -297,6 +320,7 @@ class MLService:
         df_4h["close_lag1"] = df_4h["close"].shift(1)
         df_4h.dropna(inplace=True)
         self.actual_trend_cols = ["sma_diff", "adx", "dmi_diff", "close_lag1"]
+        self.trend_input_shape = (self.lookback, len(self.actual_trend_cols))
         scaler = RobustScaler()
         df_4h[self.actual_trend_cols] = scaler.fit_transform(df_4h[self.actual_trend_cols])
         default_threshold = 0.3
@@ -311,7 +335,6 @@ class MLService:
             return
         X_train, y_train, X_val, y_val, _ , _ = train_val_test_split(X, y)
         logger.info("Starting trend model ensemble tuning using 4h data...")
-        import keras_tuner as kt
         self.trend_models = []
         for i in range(self.n_trend_models):
             tuner = kt.RandomSearch(
@@ -353,7 +376,6 @@ class MLService:
     async def train_trend_models(self):
         await self.tune_trend_models()
 
-    # -------------- Signal Model Methods (using 15min data) --------------
     async def tune_signal_model(self):
         logger.info("Tuning signal model: fetching data...")
 
@@ -367,12 +389,21 @@ class MLService:
             df_local = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
             df_local["time"] = pd.to_datetime(df_local["time"])
             df_local.set_index("time", inplace=True)
-            df_local = df_local.asfreq("1min")
+            # Reindex to 1-minute frequency
+            start = df_local.index.min()
+            end = df_local.index.max()
+            df_local = df_local.reindex(pd.date_range(start=start, end=end, freq="1min"))
+            df_local.sort_index(inplace=True)
+            df_local.ffill(inplace=True)
             return df_local
 
         self._signal_tuning_data = await _fetch_signal_data()
         df = self._signal_tuning_data.copy()
-        # Preprocess the data
+        for col in ["open", "high", "low", "close", "volume"]:
+            try:
+                df[col] = df[col].astype(float)
+            except Exception as e:
+                logger.error("Error converting column %s to float: %s", col, str(e))
         for col in ["close", "volume"]:
             df[col] = exponential_smooth(df[col])
             df[col] = median_filter(df[col], window=5)
@@ -384,6 +415,7 @@ class MLService:
             "close": "last",
             "volume": "sum"
         }).ffill()
+        logger.info("Signal data time span: %s to %s", df_15.index.min(), df_15.index.max())
         df_15["returns"] = df_15["close"].pct_change()
         df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14)
         df_15["macd_diff"] = ta.trend.MACD(df_15["close"], window_slow=26, window_fast=12, window_sign=9).macd_diff()
@@ -393,6 +425,10 @@ class MLService:
             high=df_15["high"], low=df_15["low"], close=df_15["close"], window=14
         )
         df_15["atr"] = atr_indicator.average_true_range()
+        if df_15["atr"].empty or df_15["atr"].iloc[-1] <= 0:
+            logger.warning("Computed ATR non-positive in signal data. Applying fallback ATR.")
+            fallback_atr = df_15["close"].pct_change().rolling(window=14).std().iloc[-1] * df_15["close"].iloc[-1]
+            df_15["atr"] = fallback_atr if fallback_atr > 0 else 0.01 * df_15["close"].iloc[-1]
         df_15["volatility_ratio"] = (df_15["high"] - df_15["low"]) / df_15["close"]
         df_15["cmf"] = ta.volume.ChaikinMoneyFlowIndicator(
             high=df_15["high"], low=df_15["low"], close=df_15["close"],
@@ -416,22 +452,10 @@ class MLService:
         for col in self.signal_feature_cols:
             if col not in df_15.columns:
                 df_15[col] = 0.0
-        features_all = df_15[self.signal_feature_cols].copy()
+        self.actual_signal_cols = self.signal_feature_cols
+        input_shape = (self.lookback, len(self.actual_signal_cols))
+        self.signal_input_shape = input_shape
         scaler = RobustScaler()
-        features_scaled = scaler.fit_transform(features_all)
-        features_all = pd.DataFrame(features_scaled, index=features_all.index, columns=self.signal_feature_cols)
-        from sklearn.ensemble import RandomForestClassifier
-        rf = RandomForestClassifier(n_estimators=100, random_state=42)
-        rf.fit(features_all, signal_labels)
-        importances = rf.feature_importances_
-        median_importance = np.median(importances)
-        selected_indices = np.where(importances >= median_importance)[0]
-        selected_features = [self.signal_feature_cols[i] for i in selected_indices]
-        if not selected_features:
-            logger.warning("No features selected by RandomForest; defaulting to signal_feature_cols")
-            selected_features = self.signal_feature_cols
-        logger.info("Selected features for signal model:", selected_features=selected_features)
-        self.actual_signal_cols = selected_features
         df_15[self.actual_signal_cols] = scaler.fit_transform(df_15[self.actual_signal_cols])
         features = df_15[self.actual_signal_cols].values
         X, y = self._make_sequences(features, signal_labels, self.lookback)
@@ -441,7 +465,6 @@ class MLService:
         X_train, y_train, X_val, y_val, X_test, y_test = train_val_test_split(X, y)
         self._signal_input_shape = (X_train.shape[1], X_train.shape[2])
         logger.info("Starting signal model tuning...")
-        import keras_tuner as kt
         tuner = kt.RandomSearch(
             self.build_signal_model_tuner,
             objective="val_loss",
@@ -490,6 +513,19 @@ class MLService:
             optimizer=optimizer,
             metrics=["accuracy"]
         )
+        return model
+
+    def _build_trend_model(self, input_shape, num_classes=3, dropout_rate=0.2, lstm_units=64):
+        inputs = Input(shape=input_shape)
+        x = Conv1D(filters=32, kernel_size=3, activation='relu', padding='same')(inputs)
+        x = Dropout(dropout_rate)(x)
+        x = Bidirectional(LSTM(lstm_units, return_sequences=False))(x)
+        x = Dropout(dropout_rate)(x)
+        outputs = Dense(num_classes, activation='softmax')(x)
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=tf.keras.optimizers.Adam(),
+                      loss='categorical_crossentropy',
+                      metrics=['accuracy'])
         return model
 
     def _build_dedicated_signal_model(self, input_shape, num_classes=3):
@@ -602,7 +638,6 @@ class MLService:
         cw_dict = dict(zip(unique, cw))
         sample_weights = np.array([cw_dict[label] for label in y_train])
         self.signal_models = []
-        import keras_tuner as kt
         for i in range(n_models):
             input_shape = (X_train.shape[1], X_train.shape[2])
             model = self._build_dedicated_signal_model(input_shape, num_classes=3)
@@ -626,6 +661,48 @@ class MLService:
         self.signal_model_ready = True
         return self.signal_models
 
+    def _make_sequences(self, features, labels, lookback):
+        X, y = [], []
+        for i in range(len(features) - lookback):
+            X.append(features[i : i + lookback])
+            y.append(labels[i + lookback])
+        return np.array(X), np.array(y)
+
+    def preprocess_dataframe(self, df):
+        df = df.copy()
+        # Convert numeric columns explicitly to float and log stats
+        for col in ["open", "high", "low", "close", "volume"]:
+            try:
+                df[col] = df[col].astype(float)
+            except Exception as e:
+                logger.error("Error converting column %s to float: %s", col, str(e))
+        logger.debug("Preprocessing: Column stats before reindexing - open(min=%.2f, max=%.2f), high(min=%.2f, max=%.2f), low(min=%.2f, max=%.2f), close(min=%.2f, max=%.2f)",
+                     df["open"].min(), df["open"].max(),
+                     df["high"].min(), df["high"].max(),
+                     df["low"].min(), df["low"].max(),
+                     df["close"].min(), df["close"].max())
+        # Reindex DataFrame to 1-minute frequency
+        start = df.index.min()
+        end = df.index.max()
+        expected_minutes = int(((end - start).total_seconds() / 60)) + 1
+        df = df.reindex(pd.date_range(start=start, end=end, freq="1min"))
+        df.sort_index(inplace=True)
+        df.ffill(inplace=True)
+        logger.debug("Preprocessing: After reindexing, rows=%d", len(df))
+        for col in ["close", "volume"]:
+            df[col] = exponential_smooth(df[col])
+            df[col] = median_filter(df[col], window=5)
+        df = add_lag_features(df, ["close"], lags=[1])
+        # Instead of dropping rows immediately, repair them if possible.
+        repaired_df = df.apply(repair_candle_row, axis=1)
+        # Keep only rows with valid close values.
+        valid_df = repaired_df[repaired_df["close"] > 0]
+        dropped = len(df) - len(valid_df)
+        if dropped > 0:
+            logger.warning("Dropped %d rows due to data integrity issues (after repair).", dropped)
+        if len(valid_df) < 0.8 * expected_minutes:
+            logger.warning("Preprocessed candle data has fewer rows (%d) than expected (%d)", len(valid_df), expected_minutes)
+        return valid_df
 
 if __name__ == "__main__":
     async def main():

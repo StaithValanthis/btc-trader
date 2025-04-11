@@ -7,6 +7,7 @@ import asyncio
 import math
 import json
 import gc
+import traceback
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -17,7 +18,7 @@ from pybit.unified_trading import HTTP
 from structlog import get_logger
 
 from app.core import Database, Config
-from app.services.ml_service import MLService, calculate_dmi
+from app.services.ml_service import MLService, calculate_dmi, SIGNAL_PROB_THRESHOLD
 from app.services.backfill_service import maybe_backfill_candles
 from app.utils.cache import redis_client
 
@@ -89,12 +90,12 @@ def enhanced_get_market_regime(df, adx_period=14, base_threshold=25):
                     regime=regime)
         return regime
     except Exception as e:
-        logger.error("Error in enhanced market regime detection", error=str(e))
+        logger.error("Error in enhanced market regime detection", error=str(e), traceback=traceback.format_exc())
         return "sideways"
 
 class TradeService:
     def __init__(self):
-        # Ensure MLService is configured to set its actual feature lists.
+        # Initialize MLService with lookback=60 and ensemble parameters.
         self.ml_service = MLService(lookback=60, ensemble_size=3, n_trend_models=2)
         self.session = None
         self.min_qty = None
@@ -116,7 +117,7 @@ class TradeService:
             await self.ml_service.initialize()
             logger.info("Trade service initialized successfully")
         except Exception as e:
-            logger.critical("Fatal error initializing trade service", error=str(e))
+            logger.critical("Fatal error initializing trade service", error=str(e), traceback=traceback.format_exc())
             raise
         asyncio.create_task(self.ml_service.schedule_daily_retrain())
         asyncio.create_task(self.update_open_trade_stops_task())
@@ -150,7 +151,7 @@ class TradeService:
                     return True
             return False
         except Exception as e:
-            logger.error("Error checking open trade", error=str(e))
+            logger.error("Error checking open trade", error=str(e), traceback=traceback.format_exc())
             return False
 
     def compute_adaptive_stop_loss_and_risk(self, current_price: float, atr_value: float, signal: str,
@@ -214,7 +215,7 @@ class TradeService:
             else:
                 logger.error("Error updating trade stops", data=response)
         except Exception as e:
-            logger.error("Exception in update_trade_stops", error=str(e))
+            logger.error("Exception in update_trade_stops", error=str(e), traceback=traceback.format_exc())
 
     async def update_open_trade_stops_task(self):
         while self.running:
@@ -264,7 +265,7 @@ class TradeService:
                     await self.update_trade_stops(stop_loss, take_profit)
                     logger.info("Updated open trade stops", stop_loss=stop_loss, take_profit=take_profit)
                 except Exception as e:
-                    logger.error("Error updating open trade stops", error=str(e))
+                    logger.error("Error updating open trade stops", error=str(e), traceback=traceback.format_exc())
             await asyncio.sleep(60)
 
     async def run_trading_logic(self):
@@ -302,10 +303,31 @@ class TradeService:
                     await asyncio.sleep(60)
                     continue
 
-                atr_indicator = ta.volatility.AverageTrueRange(
-                    high=df_15["high"], low=df_15["low"], close=df_15["close"], window=14
-                )
-                df_15["atr"] = atr_indicator.average_true_range()
+                try:
+                    atr_indicator = ta.volatility.AverageTrueRange(
+                        high=df_15["high"].astype(float), 
+                        low=df_15["low"].astype(float), 
+                        close=df_15["close"].astype(float), 
+                        window=14
+                    )
+                    computed_atr = atr_indicator.average_true_range()
+                except Exception as e:
+                    logger.error("Error calculating ATR", error=str(e), traceback=traceback.format_exc())
+                    computed_atr = None
+
+                if computed_atr is not None and not computed_atr.empty:
+                    atr_value = computed_atr.iloc[-1]
+                else:
+                    atr_value = 0
+
+                # Use fallback ATR if computed ATR is non-positive
+                if atr_value <= 0:
+                    logger.warning("ATR value non-positive (%.4f). Using fallback ATR. Last 3 rows of df_15: %s",
+                                   atr_value, df_15.tail(3).to_json())
+                    fallback_atr = df_15["close"].pct_change().rolling(window=14).std().iloc[-1] * df_15["close"].iloc[-1]
+                    atr_value = fallback_atr if fallback_atr > 0 else 0.01 * df_15["close"].iloc[-1]
+
+                df_15["atr"] = computed_atr if computed_atr is not None and not computed_atr.empty else atr_value
                 df_15["rsi"] = ta.momentum.rsi(df_15["close"], window=14).ffill()
                 macd = ta.trend.MACD(df_15["close"], window_slow=26, window_fast=12, window_sign=9)
                 df_15["macd_diff"] = macd.macd_diff().ffill()
@@ -317,7 +339,7 @@ class TradeService:
                     await asyncio.sleep(60)
                     continue
 
-                # Attempt to produce 4h data for trend
+                # --- Trend Prediction Section with Enhanced Defensive Checks ---
                 df_4h = df_1min.resample("4h").agg({
                     "open": "first", "high": "max", "low": "min",
                     "close": "last", "volume": "sum"
@@ -325,77 +347,159 @@ class TradeService:
                 logger.debug("df_4h shape in run_trading_logic", shape=df_4h.shape,
                              min_ts=str(df_4h.index.min()), max_ts=str(df_4h.index.max()),
                              freq=str(df_4h.index.inferred_freq))
-                # Build minimal 4h feature set
-                df_4h["sma20"] = df_4h["close"].rolling(window=20, min_periods=1).mean()
-                df_4h["sma50"] = df_4h["close"].rolling(window=50, min_periods=1).mean()
-                df_4h["sma_diff"] = df_4h["sma20"] - df_4h["sma50"]
-                df_4h["adx"] = ta.trend.ADXIndicator(
-                    high=df_4h["high"], low=df_4h["low"],
-                    close=df_4h["close"], window=14
-                ).adx()
-                try:
-                    dmi, plus_di, minus_di = calculate_dmi(df_4h["high"], df_4h["low"], df_4h["close"], window=14)
-                    df_4h["dmi_diff"] = plus_di - minus_di
-                except Exception as e:
-                    logger.warning("Custom DMI calculation failed in predict_trend", error=str(e))
-                    df_4h["dmi_diff"] = 0.0
-                df_4h["close_lag1"] = df_4h["close"].shift(1)
-                df_4h.ffill(inplace=True)
-                df_4h.dropna(inplace=True)
-
-                # Minimal shape check
-                if len(df_4h) < self.ml_service.lookback:
+                if len(df_4h) < 14:
+                    logger.error("Insufficient 4h data for ADX calculation: len(df_4h)=%d", len(df_4h))
                     trend_prediction = "Hold"
-                    logger.warning("Not enough 4h data for trend prediction; defaulting to 'Hold'")
                 else:
-                    last_slice = df_4h.tail(self.ml_service.lookback).copy()
-                    from sklearn.preprocessing import RobustScaler
-                    used_cols = ["sma_diff", "adx", "dmi_diff", "close_lag1"]
-                    scaler = RobustScaler()
-                    last_slice[used_cols] = scaler.fit_transform(last_slice[used_cols])
-                    seq = last_slice[used_cols].values
-                    logger.debug("trend seq shape before np.expand_dims", shape=seq.shape)
-                    if seq.size == 0 or seq.shape[0] <= 0 or seq.shape[1] <= 0:
-                        logger.error("Trend seq is empty/invalid; defaulting to 'Hold'", shape=seq.shape)
+                    df_4h["sma20"] = df_4h["close"].rolling(window=20, min_periods=1).mean()
+                    df_4h["sma50"] = df_4h["close"].rolling(window=50, min_periods=1).mean()
+                    df_4h["sma_diff"] = df_4h["sma20"] - df_4h["sma50"]
+                    try:
+                        df_4h["adx"] = ta.trend.ADXIndicator(
+                            high=df_4h["high"], low=df_4h["low"],
+                            close=df_4h["close"], window=14
+                        ).adx()
+                    except Exception as e:
+                        logger.error("Error calculating ADX on 4h data", error=str(e), traceback=traceback.format_exc())
                         trend_prediction = "Hold"
                     else:
                         try:
-                            seq = np.expand_dims(seq, axis=0)
-                        except Exception as expand_err:
-                            logger.error("np.expand_dims for trend seq failed", error=str(expand_err))
+                            dmi, plus_di, minus_di = calculate_dmi(df_4h["high"], df_4h["low"], df_4h["close"], window=14)
+                            df_4h["dmi_diff"] = plus_di - minus_di
+                        except Exception as e:
+                            logger.warning("Custom DMI calculation failed in predict_trend", error=str(e))
+                            df_4h["dmi_diff"] = 0.0
+                        df_4h["close_lag1"] = df_4h["close"].shift(1)
+                        df_4h.ffill(inplace=True)
+                        df_4h.dropna(inplace=True)
+
+                        trend_cols = self.ml_service.actual_trend_cols if self.ml_service.actual_trend_cols else ["sma_diff", "adx", "dmi_diff", "close_lag1"]
+                        if len(df_4h) < self.ml_service.lookback or not all(col in df_4h.columns for col in trend_cols):
                             trend_prediction = "Hold"
-                            seq = None
-                        if seq is None or seq.size == 0:
-                            trend_prediction = "Hold"
-                            logger.warning("Trend seq is None or empty; returning 'Hold'")
+                            logger.warning("Not enough 4h data or missing required trend columns; defaulting to 'Hold'",
+                                           available_rows=len(df_4h),
+                                           required_lookback=self.ml_service.lookback,
+                                           missing=[col for col in trend_cols if col not in df_4h.columns])
                         else:
-                            logger.debug("trend seq shape after expand_dims", shape=seq.shape)
-                            # Use ensemble
-                            if not self.ml_service.trend_models:
+                            last_slice = df_4h.tail(self.ml_service.lookback).copy()
+                            from sklearn.preprocessing import RobustScaler
+                            scaler = RobustScaler()
+                            last_slice[trend_cols] = scaler.fit_transform(last_slice[trend_cols])
+                            seq = last_slice[trend_cols].values
+                            logger.debug("Trend seq shape before expand_dims", shape=seq.shape)
+                            if seq.size == 0 or seq.shape[0] <= 0 or seq.shape[1] <= 0:
                                 trend_prediction = "Hold"
-                                logger.warning("No trend models available; returning 'Hold'")
+                                logger.error("Trend seq is empty/invalid; defaulting to 'Hold'", shape=seq.shape)
                             else:
-                                # Collect probabilities
-                                probs_ensemble = []
-                                for model in self.ml_service.trend_models:
-                                    out = model.predict(seq)
-                                    probs_ensemble.append(out)
-                                avg_probs = np.mean(np.array(probs_ensemble), axis=0)
-                                conf = float(np.max(avg_probs))
-                                logger.debug("Trend model avg_probs", avg_probs=avg_probs.tolist(), conf=conf)
-                                if conf < self.ml_service.TREND_PROB_THRESHOLD:
-                                    logger.info("Trend prediction confidence too low", confidence=conf)
+                                expected_trend_shape = (self.ml_service.lookback, len(trend_cols))
+                                if seq.shape != expected_trend_shape:
+                                    logger.error("Trend seq shape mismatch: expected %s but got %s", expected_trend_shape, seq.shape)
                                     trend_prediction = "Hold"
                                 else:
-                                    trend_class = np.argmax(avg_probs, axis=1)[0]
-                                    trend_prediction = {
-                                        0: "Uptrending",
-                                        1: "Downtrending",
-                                        2: "Sideways"
-                                    }.get(trend_class, "Sideways")
-
-                # get the short-term signal from the 15-min data
-                signal_prediction = self.predict_signal(df_15)
+                                    try:
+                                        seq = np.expand_dims(seq, axis=0)
+                                    except Exception as expand_err:
+                                        logger.error("np.expand_dims for trend seq failed", error=str(expand_err), traceback=traceback.format_exc())
+                                        trend_prediction = "Hold"
+                                        seq = None
+                                    if seq is None or seq.size == 0:
+                                        trend_prediction = "Hold"
+                                        logger.warning("Trend seq is None or empty; returning 'Hold'")
+                                    else:
+                                        logger.debug("Trend seq shape after expand_dims", shape=seq.shape)
+                                        if not self.ml_service.trend_models:
+                                            trend_prediction = "Hold"
+                                            logger.warning("No trend models available; returning 'Hold'")
+                                        else:
+                                            probs_ensemble = []
+                                            for model in self.ml_service.trend_models:
+                                                try:
+                                                    logger.debug("Trend model expected input shape", expected_shape=model.input_shape)
+                                                    pred = model.predict(seq)
+                                                    logger.debug("Trend model prediction shape", prediction_shape=pred.shape)
+                                                    probs_ensemble.append(pred)
+                                                except Exception as e:
+                                                    logger.error("Trend model predict failed", error=str(e), seq_shape=seq.shape, expected_shape=model.input_shape, traceback=traceback.format_exc())
+                                                    trend_prediction = "Hold"
+                                                    break
+                                            if probs_ensemble:
+                                                avg_probs = np.mean(np.array(probs_ensemble), axis=0)
+                                                conf = float(np.max(avg_probs))
+                                                logger.debug("Trend model avg_probs", avg_probs=avg_probs.tolist(), conf=conf)
+                                                if conf < self.ml_service.TREND_PROB_THRESHOLD:
+                                                    logger.info("Trend prediction confidence too low", confidence=conf)
+                                                    trend_prediction = "Hold"
+                                                else:
+                                                    trend_class = np.argmax(avg_probs, axis=1)[0]
+                                                    trend_prediction = {
+                                                        0: "Uptrending",
+                                                        1: "Downtrending",
+                                                        2: "Sideways"
+                                                    }.get(trend_class, "Sideways")
+                # --- Signal Prediction Section with Enhanced Defensive Checks ---
+                from sklearn.preprocessing import RobustScaler
+                df_15 = df_1min.asfreq("1min").resample("15min").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum"
+                }).ffill().dropna()
+                if len(df_15) < self.ml_service.lookback:
+                    logger.warning("predict_signal: Not enough bars in df_15 for inference; returning 'Hold'",
+                                   have=len(df_15), needed=self.ml_service.lookback)
+                    signal_prediction = "Hold"
+                else:
+                    used_cols = self.ml_service.actual_signal_cols if self.ml_service.actual_signal_cols else self.ml_service.signal_feature_cols
+                    for c in used_cols:
+                        if c not in df_15.columns:
+                            df_15[c] = 0.0
+                    scaler = RobustScaler()
+                    df_15[used_cols] = scaler.fit_transform(df_15[used_cols])
+                    last_slice = df_15.tail(self.ml_service.lookback).copy()
+                    if len(last_slice) < self.ml_service.lookback:
+                        logger.warning("predict_signal: last_slice too short; returning 'Hold'",
+                                       have=len(last_slice), needed=self.ml_service.lookback)
+                        signal_prediction = "Hold"
+                    else:
+                        seq_sig = last_slice[used_cols].values
+                        logger.debug("predict_signal seq shape before expand_dims", shape=seq_sig.shape)
+                        if seq_sig.size == 0 or seq_sig.shape[0] <= 0 or seq_sig.shape[1] <= 0:
+                            logger.error("predict_signal seq invalid shape; returning 'Hold'", shape=seq_sig.shape)
+                            signal_prediction = "Hold"
+                        else:
+                            expected_sig_shape = (self.ml_service.lookback, len(used_cols))
+                            if seq_sig.shape != expected_sig_shape:
+                                logger.error("Signal seq shape mismatch: expected %s but got %s", expected_sig_shape, seq_sig.shape)
+                                signal_prediction = "Hold"
+                            else:
+                                try:
+                                    seq_sig = np.expand_dims(seq_sig, axis=0)
+                                except Exception as exp_err:
+                                    logger.error("np.expand_dims in predict_signal failed", error=str(exp_err), traceback=traceback.format_exc())
+                                    signal_prediction = "Hold"
+                                logger.debug("predict_signal seq shape after expand_dims", shape=seq_sig.shape)
+                                preds = []
+                                for model in self.ml_service.signal_models:
+                                    try:
+                                        logger.debug("Signal model expected input shape", expected_shape=model.input_shape)
+                                        pred = model.predict(seq_sig)
+                                        logger.debug("Signal model prediction shape", prediction_shape=pred.shape)
+                                        preds.append(pred)
+                                    except Exception as e:
+                                        logger.error("Signal model predict failed", error=str(e), seq_shape=seq_sig.shape, expected_shape=model.input_shape, traceback=traceback.format_exc())
+                                        signal_prediction = "Hold"
+                                        break
+                                if preds:
+                                    avg_pred = np.mean(np.array(preds), axis=0)
+                                    max_conf = float(np.max(avg_pred))
+                                    logger.debug("predict_signal avg_pred", avg_pred=avg_pred.tolist(), confidence=max_conf)
+                                    if max_conf < SIGNAL_PROB_THRESHOLD:
+                                        logger.info("Signal prediction confidence too low", probability=max_conf)
+                                        signal_prediction = "Hold"
+                                    else:
+                                        signal_class = np.argmax(avg_pred, axis=1)[0]
+                                        signal_prediction = {0: "Sell", 1: "Buy", 2: "Hold"}.get(signal_class, "Hold")
                 logger.info("Trend prediction", trend=trend_prediction)
                 logger.info("15-minute signal prediction", signal=signal_prediction)
 
@@ -423,7 +527,8 @@ class TradeService:
                 current_price = df_1min.iloc[-1]["close"]
                 atr_value = df_15["atr"].iloc[-1]
                 if atr_value <= 0:
-                    logger.warning("ATR value non-positive, cannot compute position size.")
+                    logger.warning("ATR value non-positive, cannot compute position size. Last 3 rows of df_15: %s",
+                                   df_15.tail(3).to_json())
                     await asyncio.sleep(60)
                     continue
                 stop_distance = abs(
@@ -479,7 +584,7 @@ class TradeService:
                 self.current_order_qty = order_qty
 
             except Exception as e:
-                logger.error("Error in trading logic", error=str(e))
+                logger.error("Error in trading logic", error=str(e), traceback=traceback.format_exc())
             await asyncio.sleep(60)
 
     async def exit_trade(self):
@@ -581,7 +686,7 @@ class TradeService:
                     total_balance += usd_val
             return total_balance
         except Exception as e:
-            logger.error("Failed to fetch portfolio value", error=str(e))
+            logger.error("Failed to fetch portfolio value", error=str(e), traceback=traceback.format_exc())
             return 0.0
 
     async def _log_trade(self, side: str, qty: str):
@@ -594,7 +699,7 @@ class TradeService:
                 VALUES ($1, $2, $3, $4)
             ''', datetime.now(timezone.utc), side, 0, float(qty))
         except Exception as e:
-            logger.error("Failed to log trade", error=str(e))
+            logger.error("Failed to log trade", error=str(e), traceback=traceback.format_exc())
 
     async def set_trade_leverage(self, leverage: int):
         if Config.BYBIT_CONFIG.get("category", "inverse") == "inverse":
@@ -609,7 +714,7 @@ class TradeService:
             )
             logger.info("Set leverage response", data=response)
         except Exception as e:
-            logger.error("Error setting leverage", error=str(e))
+            logger.error("Error setting leverage", error=str(e), traceback=traceback.format_exc())
 
     async def execute_trade(self, side: str, qty: str,
                             stop_loss: float = None,
@@ -647,7 +752,7 @@ class TradeService:
                 error_msg = response.get('retMsg', 'Unknown error')
                 logger.error("Trade failed", error=error_msg)
         except Exception as e:
-            logger.error("Trade execution error", error=str(e))
+            logger.error("Trade execution error", error=str(e), traceback=traceback.format_exc())
             self.current_position = None
 
     def predict_signal(self, recent_data: pd.DataFrame) -> str:
@@ -655,13 +760,11 @@ class TradeService:
             logger.warning("No signal model ensemble available or not ready; returning 'Hold'")
             return "Hold"
 
-        # minimal shape check
         if recent_data is None or recent_data.empty:
             logger.warning("predict_signal: recent_data is empty; returning 'Hold'")
             return "Hold"
 
         from sklearn.preprocessing import RobustScaler
-        # We do a basic 15min resample to match the approach in the ml_service
         df_15 = recent_data.asfreq("1min").resample("15min").agg({
             "open": "first",
             "high": "max",
@@ -674,21 +777,13 @@ class TradeService:
                            have=len(df_15), needed=self.ml_service.lookback)
             return "Hold"
 
-        used_cols = self.ml_service.actual_signal_cols or self.ml_service.signal_feature_cols
-        # if used_cols is empty, skip
-        if not used_cols:
-            logger.warning("predict_signal: no actual_signal_cols available; returning 'Hold'")
-            return "Hold"
-
-        # minimal approach: create feature columns if missing
+        used_cols = self.ml_service.actual_signal_cols if self.ml_service.actual_signal_cols else self.ml_service.signal_feature_cols
         for c in used_cols:
             if c not in df_15.columns:
                 df_15[c] = 0.0
 
-        # scale them
         scaler = RobustScaler()
         df_15[used_cols] = scaler.fit_transform(df_15[used_cols])
-        # build last slice
         last_slice = df_15.tail(self.ml_service.lookback).copy()
         if len(last_slice) < self.ml_service.lookback:
             logger.warning("predict_signal: last_slice too short; returning 'Hold'",
@@ -699,19 +794,26 @@ class TradeService:
         if seq.size == 0 or seq.shape[0] <= 0 or seq.shape[1] <= 0:
             logger.error("predict_signal seq invalid shape; returning 'Hold'", shape=seq.shape)
             return "Hold"
+        expected_sig_shape = (self.ml_service.lookback, len(used_cols))
+        if seq.shape != expected_sig_shape:
+            logger.error("Signal seq shape mismatch: expected %s but got %s", expected_sig_shape, seq.shape)
+            return "Hold"
         try:
             seq = np.expand_dims(seq, axis=0)
         except Exception as exp_err:
-            logger.error("np.expand_dims in predict_signal failed", error=str(exp_err))
+            logger.error("np.expand_dims in predict_signal failed", error=str(exp_err), traceback=traceback.format_exc())
             return "Hold"
         logger.debug("predict_signal seq shape after expand_dims", shape=seq.shape)
-
-        # do ensemble predictions
-        try:
-            preds = [model.predict(seq) for model in self.ml_service.signal_models]
-        except Exception as e:
-            logger.error("Signal model predict failed", error=str(e), seq_shape=seq.shape)
-            return "Hold"
+        preds = []
+        for model in self.ml_service.signal_models:
+            try:
+                logger.debug("Signal model expected input shape", expected_shape=model.input_shape)
+                pred = model.predict(seq)
+                logger.debug("Signal model prediction shape", prediction_shape=pred.shape)
+                preds.append(pred)
+            except Exception as e:
+                logger.error("Signal model predict failed", error=str(e), seq_shape=seq.shape, expected_shape=model.input_shape, traceback=traceback.format_exc())
+                return "Hold"
         avg_pred = np.mean(np.array(preds), axis=0)
         max_conf = float(np.max(avg_pred))
         logger.debug("predict_signal avg_pred", avg_pred=avg_pred.tolist(), confidence=max_conf)
@@ -722,15 +824,15 @@ class TradeService:
         signal_label = {0: "Sell", 1: "Buy", 2: "Hold"}.get(signal_class, "Hold")
         return signal_label
 
-async def periodic_gc(interval_seconds: int = 300):
-    while True:
-        collected = gc.collect()
-        logger.info("Garbage collection complete", objects_collected=collected)
-        await asyncio.sleep(interval_seconds)
+    async def periodic_gc(self, interval_seconds: int = 300):
+        while True:
+            collected = gc.collect()
+            logger.info("Garbage collection complete", objects_collected=collected)
+            await asyncio.sleep(interval_seconds)
 
 if __name__ == "__main__":
     async def main():
-        asyncio.create_task(periodic_gc(300))
+        asyncio.create_task(TradeService().periodic_gc(300))
         trade_service = TradeService()
         await trade_service.initialize()
         while True:

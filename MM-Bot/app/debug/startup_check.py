@@ -27,7 +27,7 @@ class StartupChecker:
             min_rows=2000,
             symbol="BTCUSD",
             interval=1,
-            days_to_fetch=180
+            days_to_fetch=90
         )
 
         logger.info("All startup checks passed")
