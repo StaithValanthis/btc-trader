@@ -31,13 +31,7 @@ class Config:
     TRADING_CONFIG = {
         'symbols':       os.getenv(
                             'SYMBOLS',
-                            'BTCUSDT,ETHUSDT,XRPUSDT,BNBUSDT,SOLUSDT,TRXUSDT,DOGEUSDT,ADAUSDT,'
-                            'HYPEUSDT,BCHUSDT,SUIUSDT,LEOUSDT,LINKUSDT,XLMUSDT,AVAXUSDT,TONUSDT,'
-                            'SHIBUSDT,LTCUSDT,HBARUSDT,XMRUSDT,DOTUSDT,BGBUSDT,UNIUSDT,PIUSDT,'
-                            'PEPEUSDT,AAVEUSDT,OKBUSDT,TAOUSDT,APTUSDT,CROUSDT,ICPUSDT,NEARUSDT,'
-                            'ETCUSDT,ONDOUSDT,GTUSDT,MNTUSDT,MATICUSDT,KASUSDT,TRUMPUSDT,VETUSDT,'
-                            'SKYUSDT,ENAUSDT,RENDERUSDT,ATOMUSDT,FETUSDT,FILUSDT,ALGOUSDT,WLDUSDT,'
-                            'KCSUSDT,ARBUSDT'
+                            'BTCUSDT,ETHUSDT'
                         ).split(','),
         # Risk settings
         'risk_pct':      float(os.getenv('RISK_PCT', '0.02')),   # 2% of equity per trade

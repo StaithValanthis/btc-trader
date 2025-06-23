@@ -4,22 +4,24 @@ import asyncio
 from structlog import get_logger
 
 from app.core.config import Config
-from app.utils.symbols import fetch_top_symbols
 from app.init import TradingBot
 
 logger = get_logger(__name__)
 
 async def main():
-    # ── Dynamically fetch top 30 USDT-perps by 24 h volume ──
-    try:
-        top30 = fetch_top_symbols(30)
-        Config.TRADING_CONFIG['symbols'] = top30
-        logger.info("Overwrote TRADING_CONFIG symbols with top30 by volume")
-    except Exception as e:
-        logger.warning("Could not fetch top symbols; using defaults", error=str(e))
+    # log the raw configuration
+    logger.info("Loaded configuration", config=Config.__dict__)
+
+    # -- Remove any manual overwrite of Config.TRADING_CONFIG['symbols'] here! --
+    # The TradingBot.run() method will:
+    #   - fetch top-30 when testnet=False (i.e. mainnet)
+    #   - use the static symbols from TRADING_CONFIG when testnet=True
 
     bot = TradingBot()
-    await bot.run()
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        await bot.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
