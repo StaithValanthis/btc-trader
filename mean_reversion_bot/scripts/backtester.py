@@ -2,19 +2,26 @@
 """
 Grid backtester for BB+RSI+SL mean reversion.
 """
+import argparse
 import asyncio
 import itertools
 import pandas as pd
 import numpy as np
+import json
 from app.core.database import Database
 from app.core.config import Config
 
-async def fetch_candles(limit=None):
+async def fetch_candles(symbol=None, limit=None):
     await Database.initialize()
-    q = "SELECT time, open, high, low, close FROM candles ORDER BY time ASC"
+    q = "SELECT time, open, high, low, close FROM candles"
+    args = []
+    if symbol:
+        q += " WHERE symbol = $1"
+        args.append(symbol)
+    q += " ORDER BY time ASC"
     if limit:
         q += f" LIMIT {limit}"
-    rows = await Database.fetch(q)
+    rows = await Database.fetch(q, *args)
     await Database.close()
     df = pd.DataFrame(rows, columns=["time","open","high","low","close"])
     df['time'] = pd.to_datetime(df['time'])
@@ -22,16 +29,11 @@ async def fetch_candles(limit=None):
     return df
 
 def simulate(df, bb_window, bb_dev, rsi_long, rsi_short, sl_pct):
-    """
-    Return dict with 'pnl' and 'sharpe', applying an SL at sl_pct.
-    """
-    # Bollinger Bands
     mid   = df['close'].rolling(bb_window).mean()
     std   = df['close'].rolling(bb_window).std()
     upper = mid + bb_dev * std
     lower = mid - bb_dev * std
 
-    # RSI
     delta    = df['close'].diff()
     gain     = delta.clip(lower=0)
     loss     = -delta.clip(upper=0)
@@ -47,7 +49,6 @@ def simulate(df, bb_window, bb_dev, rsi_long, rsi_short, sl_pct):
 
     for t in df.index:
         price = df.at[t, 'close']
-        # Entry
         if position == 0:
             if price < lower.at[t] and rsi.at[t] < rsi_long:
                 position    = 1
@@ -57,7 +58,6 @@ def simulate(df, bb_window, bb_dev, rsi_long, rsi_short, sl_pct):
                 position    = -1
                 entry_price = price
                 stop_price  = entry_price * (1 + sl_pct)
-        # Exit on mid-band or SL
         elif position == 1:
             if price >= mid.at[t]:
                 returns.append((price - entry_price) / entry_price)
@@ -82,7 +82,12 @@ def simulate(df, bb_window, bb_dev, rsi_long, rsi_short, sl_pct):
     return {'pnl': pnl, 'sharpe': sharpe}
 
 async def main():
-    df = await fetch_candles(limit=Config.PARAM_RANGES['BB_WINDOW'][-1] * 100)
+    parser = argparse.ArgumentParser(description="Grid backtest mean reversion strategy.")
+    parser.add_argument('--symbol', type=str, help="Symbol to backtest (e.g. BTCUSDT)")
+    parser.add_argument('--limit', type=int, help="Limit number of candles", default=None)
+    args = parser.parse_args()
+
+    df = await fetch_candles(symbol=args.symbol, limit=args.limit)
     pr = Config.PARAM_RANGES
 
     results = []
@@ -91,19 +96,28 @@ async def main():
         pr['RSI_LONG'],  pr['RSI_SHORT'],
         pr['SL_PCT']
     ):
-        m = simulate(df, bb_w, bb_d, rl, rs, sl)
-        results.append({
-            'window':    bb_w,
-            'dev':       bb_d,
-            'rsi_long':  rl,
-            'rsi_short': rs,
-            'sl_pct':    sl,
-            'pnl':       m['pnl'],
-            'sharpe':    m['sharpe']
-        })
+        try:
+            m = simulate(df, bb_w, bb_d, rl, rs, sl)
+            results.append({
+                'window':    bb_w,
+                'dev':       bb_d,
+                'rsi_long':  rl,
+                'rsi_short': rs,
+                'sl_pct':    sl,
+                'pnl':       m['pnl'],
+                'sharpe':    m['sharpe']
+            })
+        except Exception as e:
+            print(f"Simulation error for params ({bb_w},{bb_d},{rl},{rs},{sl}): {e}")
 
     out = pd.DataFrame(results).sort_values(['sharpe','pnl'], ascending=False).head(10)
     print(out)
+    # Persist best params to file
+    if not out.empty:
+        best = out.head(1).to_dict(orient='records')[0]
+        with open('best_params.json', 'w') as f:
+            json.dump(best, f, indent=2)
+        print("Best params written to best_params.json")
 
 if __name__ == '__main__':
     asyncio.run(main())
