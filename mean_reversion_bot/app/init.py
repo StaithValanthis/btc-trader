@@ -1,4 +1,4 @@
-# File: mean_reversion_bot/app/init.py
+# File: app/init.py
 
 import asyncio
 import contextlib
@@ -16,7 +16,6 @@ logger = get_logger(__name__)
 
 class TradingBot:
     def __init__(self):
-        # will hold only symbols successfully initialized
         self.symbols: list[str] = []
         self.md_service    = BybitMarketData()
         self.candle_svcs   = {}  # symbol → CandleService
@@ -28,29 +27,35 @@ class TradingBot:
         # 1) Pre‐run checks & initial backfill
         await StartupChecker.run_checks()
 
-        # 2) Start MD websocket
+        # 2) Initialize DB & MD websocket
         self.running = True
         await self.md_service.run()
 
-        # 3) Determine initial symbol‐set
-        if not Config.BYBIT_CONFIG.get('testnet', True):
-            # mainnet: fetch top-30 by volume
-            to_trade = await asyncio.to_thread(fetch_top_symbols, 30)
+        # 3) Pick your symbols
+        if Config.BYBIT_CONFIG.get("testnet", False):
+            # testnet: leave your defaults intact
+            initial = Config.TRADING_CONFIG["symbols"]
+            logger.info("Testnet mode: using default symbols", symbols=initial)
         else:
-            # testnet: use the static list in config
-            to_trade = Config.TRADING_CONFIG.get('symbols', [])
+            # mainnet: fetch the top 30 by volume
+            initial = await asyncio.to_thread(fetch_top_symbols, 30)
+            logger.info("Mainnet mode: fetched top symbols by volume", symbols=initial)
 
-        await self._update_symbols(to_trade)
+        await self._update_symbols(initial)
 
-        # 4) Kick off refresh loop
-        self._refresh_task = asyncio.create_task(self._symbol_refresh_loop())
+        # 4) Kick off the symbol‐refresh loop (every hour), only on mainnet
+        if not Config.BYBIT_CONFIG.get("testnet", False):
+            self._refresh_task = asyncio.create_task(self._symbol_refresh_loop())
+        else:
+            logger.info("Testnet mode: skipping symbol‐refresh loop")
 
-        # 5) Keep running
+        # 5) Keep the bot alive
         while self.running:
             await asyncio.sleep(1)
 
     async def stop(self):
         self.running = False
+
         if self._refresh_task:
             self._refresh_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -61,31 +66,29 @@ class TradingBot:
             await svc.stop()
         for svc in self.trade_svcs.values():
             svc.stop()
+
         await Database.close()
         logger.info("TradingBot stopped")
 
     async def _symbol_refresh_loop(self, interval_s: int = 3600):
+        """Every `interval_s` seconds, re‐fetch top symbols and reconcile."""
         while self.running:
             try:
-                if not Config.BYBIT_CONFIG.get('testnet', True):
-                    new_syms = await asyncio.to_thread(fetch_top_symbols, 30)
-                else:
-                    new_syms = Config.TRADING_CONFIG.get('symbols', [])
+                new_syms = await asyncio.to_thread(fetch_top_symbols, 30)
+                logger.info("Hourly refresh: fetched top symbols by volume", symbols=new_syms)
                 await self._update_symbols(new_syms)
             except Exception as e:
                 logger.warning("Failed to refresh symbols", error=str(e))
             await asyncio.sleep(interval_s)
 
     async def _update_symbols(self, new_symbols: list[str]):
-        """
-        Ensure we only run services for symbols that successfully init;
-        tear down any extras.
-        """
-        old_set = set(self.symbols)
-        new_set = set(new_symbols)
+        old = set(self.symbols)
+        new = set(new_symbols)
 
-        # STOP services for symbols no longer desired
-        for sym in old_set - new_set:
+        to_add    = new - old
+        to_remove = old - new
+
+        for sym in to_remove:
             logger.info("Removing symbol", symbol=sym)
             cs = self.candle_svcs.pop(sym, None)
             if cs:
@@ -94,29 +97,21 @@ class TradingBot:
             if ts:
                 ts.stop()
 
-        # ADD services for brand-new symbols
-        for sym in new_set - old_set:
+        for sym in to_add:
             logger.info("Adding symbol", symbol=sym)
             cs = CandleService(sym)
             await cs.start()
+            self.candle_svcs[sym] = cs
 
             ts = TradeService(sym)
-            try:
-                ok = await ts.initialize()
-            except Exception as e:
-                ok = False
-                logger.warning("TradeService init failed; skipping symbol", symbol=sym, error=str(e))
+            await ts.initialize()
+            self.trade_svcs[sym] = ts
 
-            if not ok:
-                # if trade init fails, roll back candle svc too
-                await cs.stop()
-                continue
+        self.symbols = new_symbols
+        Config.TRADING_CONFIG['symbols'] = new_symbols
+        logger.info("Updated active symbols", symbols=new_symbols)
 
-            # both candle + trade are up
-            self.candle_svcs[sym] = cs
-            self.trade_svcs[sym]  = ts
 
-        # update our “active” list to those with a trade svc
-        self.symbols = list(self.trade_svcs.keys())
-        Config.TRADING_CONFIG['symbols'] = self.symbols
-        logger.info("Updated active symbols", symbols=self.symbols)
+# no change to this helper — only called from the mainnet branches above
+async def _fetch_top_30() -> list[str]:
+    return await asyncio.to_thread(fetch_top_symbols, 30)
