@@ -1,3 +1,5 @@
+# File: app/debug/startup_check.py
+
 import asyncio
 from structlog import get_logger
 from app.core.config import Config
@@ -9,7 +11,39 @@ logger = get_logger(__name__)
 
 class StartupChecker:
     @classmethod
-    async def _check_env_vars(cls):
+    async def run_checks(cls):
+        logger.info("Running startup checks...")
+        cls._check_env_vars()
+
+        # 1) Database
+        if Database._pool is None:
+            await Database.initialize()
+        await cls._check_db_connection()
+
+        # 2) Bybit connectivity
+        session = HTTP(
+            testnet=Config.BYBIT_CONFIG['testnet'],
+            api_key=Config.BYBIT_CONFIG['api_key'],
+            api_secret=Config.BYBIT_CONFIG['api_secret'],
+        )
+        await cls._check_bybit_connection(session)
+
+        # 3) Prune out any invalid symbols
+        cls._validate_symbols(session)
+
+        # 4) Backfill candle history for all remaining symbols
+        #    → signature is maybe_backfill_candles(min_rows, interval, days)
+        #    → here we supply those three positionally
+        await maybe_backfill_candles(
+            1000,   # min_rows
+            1,      # interval (1-minute candles)
+            7      # days of history
+        )
+
+        logger.info("All startup checks passed")
+
+    @classmethod
+    def _check_env_vars(cls):
         if not Config.BYBIT_CONFIG['api_key'] or not Config.BYBIT_CONFIG['api_secret']:
             raise EnvironmentError("BYBIT_API_KEY or BYBIT_API_SECRET not set.")
 
@@ -18,48 +52,39 @@ class StartupChecker:
         try:
             val = await Database.fetchval("SELECT 1")
             assert val == 1
-            logger.info("DB connection OK")
+            logger.info("Database connection successful")
         except Exception as e:
-            raise ConnectionError(f"DB error: {e}")
+            raise ConnectionError(f"Database connection failed: {e}")
 
     @classmethod
-    async def _check_bybit_connection(cls):
-        session = HTTP(**Config.BYBIT_CONFIG)
-        await asyncio.to_thread(session.get_server_time)
-        logger.info("Bybit API OK")
-
-    @classmethod
-    async def _determine_optimal_params(cls):
-        from scripts.backtester import fetch_candles, simulate
-        df = await fetch_candles(limit=2000)
-        pr = Config.PARAM_RANGES
-        best = {'sharpe': -float('inf')}
-        for w in pr['BB_WINDOW']:
-            for d in pr['BB_DEV']:
-                for rl in pr['RSI_LONG']:
-                    for rs in pr['RSI_SHORT']:
-                        m = simulate(df, w, d, rl, rs)
-                        if m['sharpe'] > best['sharpe']:
-                            best = {'window':w,'dev':d,'rsi_long':rl,'rsi_short':rs,'sharpe':m['sharpe']}
-        return best
-
-    @classmethod
-    async def run_checks(cls):
-        logger.info("Startup checks")
-        await cls._check_env_vars()
-        if Database._pool is None:
-            await Database.initialize()
-        await cls._check_db_connection()
-        await cls._check_bybit_connection()
-        await maybe_backfill_candles(min_rows=2000, symbol="BTCUSD", interval=1, days_to_fetch=30)
+    async def _check_bybit_connection(cls, session: HTTP):
         try:
-            opt = await cls._determine_optimal_params()
-            tc = Config.TRADING_CONFIG
-            tc['BB_WINDOW']  = opt['window']
-            tc['BB_DEV']     = opt['dev']
-            tc['RSI_LONG']   = opt['rsi_long']
-            tc['RSI_SHORT']  = opt['rsi_short']
-            logger.info("Optimized params", **opt)
+            # throws if invalid creds or endpoint
+            await asyncio.to_thread(session.get_server_time)
+            logger.info("Bybit API connection successful")
         except Exception as e:
-            logger.warning("Opt failed; using defaults", error=str(e))
-        logger.info("Startup complete")
+            raise ConnectionError(f"Bybit API connection failed: {e}")
+
+    @classmethod
+    def _validate_symbols(cls, session: HTTP):
+        """
+        Ping instruments-info for each symbol in our config and drop any that fail.
+        """
+        valid = []
+        for s in Config.TRADING_CONFIG['symbols']:
+            try:
+                resp = session.get_instruments_info(
+                    category=Config.BYBIT_CONFIG.get('category', 'linear'),
+                    symbol=s
+                )
+                if resp.get('retCode', 0) == 0:
+                    valid.append(s)
+                else:
+                    logger.warning("Skipping invalid symbol", symbol=s, error=resp.get('retMsg'))
+            except Exception as e:
+                logger.warning("Skipping invalid symbol", symbol=s, error=str(e))
+
+        dropped = set(Config.TRADING_CONFIG['symbols']) - set(valid)
+        if dropped:
+            logger.info("Filtered out invalid symbols", dropped=list(dropped))
+        Config.TRADING_CONFIG['symbols'] = valid

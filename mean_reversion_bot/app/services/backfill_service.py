@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from structlog import get_logger
 from pybit.unified_trading import HTTP
+from pybit.exceptions import InvalidRequestError
 
 from app.core.database import Database
 from app.core.config import Config
@@ -15,12 +16,12 @@ logger = get_logger(__name__)
 async def backfill_bybit_kline(
     symbol: str,
     interval: int = 1,
-    days_to_fetch: int = 365,
+    days_to_fetch: int = 7,
     start_time_ms: int = None
 ):
     """
     Fetch Bybit linear Kline (candle) data for `symbol`
-    and insert into the `candles` table.
+    and insert into the `candles` table. Skips symbol if invalid.
     """
     session = HTTP(
         testnet=Config.BYBIT_CONFIG['testnet'],
@@ -50,20 +51,28 @@ async def backfill_bybit_kline(
     logger.info(
         "Backfilling candles",
         symbol=symbol,
-        interval=interval,
         days=days_to_fetch,
         category=category
     )
 
     for _ in range(fetches_needed):
-        resp = await asyncio.to_thread(
-            session.get_kline,
-            category=category,
-            symbol=symbol,
-            interval=str(interval),
-            start=current_start,
-            limit=bars_per_fetch
-        )
+        try:
+            resp = await asyncio.to_thread(
+                session.get_kline,
+                category=category,
+                symbol=symbol,
+                interval=str(interval),
+                start=current_start,
+                limit=bars_per_fetch
+            )
+        except InvalidRequestError as e:
+            logger.warning(
+                "Skipping invalid symbol",
+                symbol=symbol,
+                error=str(e)
+            )
+            return
+
         if resp.get("retCode", 0) != 0:
             logger.error(
                 "Bybit API error",
@@ -81,12 +90,12 @@ async def backfill_bybit_kline(
         for bar in kline_data:
             try:
                 ts_ms = int(bar[0])
-                dt = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=timezone.utc)
-                o = float(bar[1])
-                h = float(bar[2])
-                l = float(bar[3])
-                c = float(bar[4])
-                v = float(bar[5])
+                dt    = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=timezone.utc)
+                o     = float(bar[1])
+                h     = float(bar[2])
+                l     = float(bar[3])
+                c     = float(bar[4])
+                v     = float(bar[5])
                 await Database.execute(
                     '''
                     INSERT INTO candles (symbol, time, open, high, low, close, volume)
@@ -115,35 +124,53 @@ async def backfill_bybit_kline(
 async def maybe_backfill_candles(
     min_rows: int = 1000,
     interval: int = 1,
-    days_to_fetch: int = 365
+    initial_days: int = 7,
+    incremental_days: int = 30
 ):
     """
-    For each symbol in Config.TRADING_CONFIG['symbols'], check its candle row count.
-    If below min_rows, backfill up to `days_to_fetch`.
+    For each symbol in Config.TRADING_CONFIG['symbols'], check its candle
+    row count. If below min_rows, backfill `initial_days`. Otherwise,
+    backfill only the last `incremental_days`. Errors per symbol are caught so
+    other symbols continue.
     """
     await Database.initialize()
     symbols = Config.TRADING_CONFIG['symbols']
 
     for symbol in symbols:
-        row_count = await Database.fetchval(
-            "SELECT COUNT(*) FROM candles WHERE symbol = $1",
-            symbol
-        )
-        logger.info("Candle row count", symbol=symbol, count=row_count)
-
-        if row_count < min_rows:
-            logger.warning(
-                "Insufficient candles; initiating backfill",
-                symbol=symbol,
-                have=row_count,
-                need=min_rows
+        try:
+            row_count = await Database.fetchval(
+                "SELECT COUNT(*) FROM candles WHERE symbol = $1",
+                symbol
             )
+            logger.info("Candle row count", symbol=symbol, count=row_count)
+
+            if row_count < min_rows:
+                days = initial_days
+                logger.warning(
+                    "Insufficient candles; using full backfill",
+                    symbol=symbol,
+                    have=row_count,
+                    need=min_rows,
+                    days=days
+                )
+            else:
+                days = incremental_days
+                logger.info(
+                    "Performing incremental backfill",
+                    symbol=symbol,
+                    days=days
+                )
+
             await backfill_bybit_kline(
                 symbol=symbol,
                 interval=interval,
-                days_to_fetch=days_to_fetch
+                days_to_fetch=days
             )
-        else:
-            logger.info("Sufficient candle data", symbol=symbol, count=row_count)
+        except Exception as e:
+            logger.error(
+                "Error backfilling symbol; continuing",
+                symbol=symbol,
+                error=str(e)
+            )
 
-    await Database.close()
+    # Note: we do NOT close Database pool here so subsequent services can use it
