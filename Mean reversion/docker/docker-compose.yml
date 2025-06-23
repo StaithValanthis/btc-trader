@@ -9,8 +9,6 @@ services:
       POSTGRES_PASSWORD: postgres
     volumes:
       - timescaledb-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     networks:
       - trading-net
     healthcheck:
@@ -22,8 +20,6 @@ services:
 
   redis:
     image: redis:7
-    ports:
-      - "6379:6379"
     networks:
       - trading-net
     healthcheck:
@@ -35,9 +31,9 @@ services:
 
   trader-app:
     build:
-      context: .
-      dockerfile: Dockerfile
-    env_file: .env
+      context: ..
+      dockerfile: ../Dockerfile
+    env_file: ../.env
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,11 +42,26 @@ services:
     networks:
       - trading-net
     volumes:
-      - ./model_storage:/app/model_storage
+      - ../:/app
     restart: unless-stopped
-    
+
+  live-tuner:
+    build:
+      context: ..
+      dockerfile: ../Dockerfile
+    env_file: ../.env
+    command: live-tuner
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-net
+    volumes:
+      - ../:/app
+    restart: unless-stopped
+
 volumes:
   timescaledb-data:
 
 networks:
-  trading-net:
+  trading-net: {}

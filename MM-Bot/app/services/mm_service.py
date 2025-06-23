@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from structlog import get_logger
 from pybit.unified_trading import HTTP
+from typing import Optional, Tuple
 
 from app.core.config import Config
 from app.core.database import Database
@@ -25,7 +26,7 @@ class MMService:
     Once a position is taken, it cancels MM orders and manages the open position with stop-loss (SL)
     and take-profit (TP) orders.
 
-    Historical data is loaded using the days_to_fetch parameter (e.g., from startup_check.py).
+    Historical data is loaded using the days_to_fetch parameter.
 
     Key parameters:
       - gamma: risk aversion coefficient.
@@ -34,47 +35,51 @@ class MMService:
 
     Tunable hyperparameters:
       - baseline_sigma: baseline volatility used for dynamic spread adjustment.
-      - refresh_rate: interval (in seconds) to refresh orders.
-      - stop_loss_pct: percentage for stop loss exit (min: 0.5% or 0.005).
-      - take_profit_pct: percentage for take profit exit (min: 0.1% or 0.001).
+      - refresh_rate: interval (in seconds) to refresh MM orders.
+      - stop_loss_pct: percentage for stop-loss exit (min: 0.5% or 0.005).
+      - take_profit_pct: percentage for take-profit exit (min: 0.1% or 0.001).
 
     Order sizing is based on available equity: number of contracts = round(equity × leverage × 0.35)
     with fixed leverage = 3×. If the computed qty is less than the exchange minimum, the minimum is enforced.
 
-    A minimum effective spread is enforced in both live trading and simulation.
-    In the simulation, if the computed bid/ask spread is less than 0.1% of the midprice,
-    the simulation returns an extreme loss so that the tuner only considers parameter sets
-    that yield a spread equal to or above 0.1% of the current price.
-    """
-    def __init__(self, risk_aversion=0.1, k=1.0, T=1.0, days_to_fetch=7):
-        self.gamma = risk_aversion         # risk aversion coefficient (γ)
-        self.k = k                         # market order arrival decay parameter
-        self.T = T                         # time horizon in days
-        self.days_to_fetch = days_to_fetch # number of days of historical data to load
-        self.sigma = None                  # estimated daily volatility (σ)
-        self.inventory = 0                 # current net inventory; update externally
-        self.entry_price = None            # entry price when a position is taken
-        self.position_qty = None           # number of contracts held in open position
-        self.session = HTTP(
-            testnet=Config.BYBIT_CONFIG['testnet'],
-            api_key=Config.BYBIT_CONFIG['api_key'],
-            api_secret=Config.BYBIT_CONFIG['api_secret']
-        )
-        self.current_bid_order_id = None
-        self.current_ask_order_id = None
-        self.running = False
-        self._historical_df = None         # Historical candle data for tuning
+    A minimum effective spread is enforced. In both live trading and simulation, if the computed bid/ask spread
+    is below 0.1% of the current price, the bid is forced to midprice - (0.1% of midprice)/2 and the ask to
+    midprice + (0.1% of midprice)/2.
 
-        # Default tunable parameters (to be updated by ML tuning)
-        self.baseline_sigma = 0.02
-        self.refresh_rate = 60
-        self.stop_loss_pct = 0.02
-        self.take_profit_pct = 0.04
+    **Position Management:**  
+    The bot checks the position status every 1 second. If a position is open (inventory ≠ 0),
+    all outstanding MM orders are immediately canceled and position management (placing SL/TP orders) begins.
+    Otherwise, limit orders are updated every 15 seconds.
+    """
+    def __init__(self, risk_aversion: float = 0.1, k: float = 1.0, T: float = 1.0, days_to_fetch: int = 7):
+        self.gamma: float = risk_aversion
+        self.k: float = k
+        self.T: float = T
+        self.days_to_fetch: int = days_to_fetch
+        self.sigma: Optional[float] = None
+        self.inventory: int = 0  # This should be updated via actual fill events.
+        self.entry_price: Optional[float] = None
+        self.position_qty: Optional[int] = None
+        self.session: HTTP = HTTP(
+            testnet=Config.BYBIT_CONFIG["testnet"],
+            api_key=Config.BYBIT_CONFIG["api_key"],
+            api_secret=Config.BYBIT_CONFIG["api_secret"],
+        )
+        self.current_bid_order_id: Optional[str] = None
+        self.current_ask_order_id: Optional[str] = None
+        self.running: bool = False
+        self._historical_df: Optional[pd.DataFrame] = None
+
+        # Default tunable parameters; will be updated via ML tuning.
+        self.baseline_sigma: float = 0.02
+        self.refresh_rate: int = 60  # This is used in simulation tuning only.
+        self.stop_loss_pct: float = 0.02
+        self.take_profit_pct: float = 0.04
 
         # Minimum order quantity (in contract units); updated from instrument info.
-        self.min_qty = None
+        self.min_qty: Optional[float] = None
 
-    async def update_volatility(self, window_minutes=1440):
+    async def update_volatility(self, window_minutes: int = 1440):
         try:
             query = (
                 "SELECT time, close FROM candles "
@@ -94,9 +99,9 @@ class MMService:
             self.sigma = sigma_min * np.sqrt(1440)
             logger.info("Volatility updated", sigma_daily=self.sigma)
         except Exception as e:
-            logger.error("Error updating volatility", error=str(e))
+            logger.exception("Error updating volatility")
 
-    def compute_bid_ask(self, midprice, inventory, baseline_sigma):
+    def compute_bid_ask(self, midprice: float, inventory: int, baseline_sigma: float) -> Tuple[float, float]:
         if self.sigma is None:
             logger.warning("Volatility not set; using default sigma of 0.005")
             self.sigma = 0.005
@@ -108,34 +113,36 @@ class MMService:
         half_spread_adjusted = half_spread * multiplier
         bid = reservation_price - half_spread_adjusted
         ask = reservation_price + half_spread_adjusted
-        logger.debug("Computed bid/ask",
-                     midprice=midprice,
-                     reservation_price=reservation_price,
-                     half_spread=half_spread,
-                     multiplier=multiplier,
-                     adjusted_half_spread=half_spread_adjusted,
-                     bid=bid,
-                     ask=ask,
-                     inventory=inventory)
+        logger.debug(
+            "Computed bid/ask",
+            midprice=midprice,
+            reservation_price=reservation_price,
+            half_spread=half_spread,
+            multiplier=multiplier,
+            adjusted_half_spread=half_spread_adjusted,
+            bid=bid,
+            ask=ask,
+            inventory=inventory,
+        )
         return bid, ask
 
-    async def cancel_existing_order(self, order_id):
+    async def cancel_existing_order(self, order_id: str):
         try:
             response = await asyncio.to_thread(
                 self.session.cancel_order,
                 category=Config.BYBIT_CONFIG.get("category", "inverse"),
                 symbol=Config.TRADING_CONFIG["symbol"],
-                orderId=order_id
+                orderId=order_id,
             )
             logger.info("Order cancellation response", order_id=order_id, response=response)
         except Exception as e:
-            logger.error("Error cancelling order", order_id=order_id, error=str(e))
+            logger.exception("Error cancelling order", order_id=order_id)
 
-    async def get_portfolio_value(self):
+    async def get_portfolio_value(self) -> float:
         try:
             balance_data = await asyncio.to_thread(
                 self.session.get_wallet_balance,
-                accountType="UNIFIED"
+                accountType="UNIFIED",
             )
             total_equity = 0.0
             for account in balance_data["result"].get("list", []):
@@ -146,7 +153,7 @@ class MMService:
             logger.info("Portfolio value fetched", equity=total_equity)
             return total_equity
         except Exception as e:
-            logger.error("Error getting portfolio value", error=str(e))
+            logger.exception("Error getting portfolio value")
             return 0.0
 
     async def get_min_order_qty(self):
@@ -154,15 +161,15 @@ class MMService:
             info = await asyncio.to_thread(
                 self.session.get_instruments_info,
                 category=Config.BYBIT_CONFIG.get("category", "inverse"),
-                symbol=Config.TRADING_CONFIG["symbol"]
+                symbol=Config.TRADING_CONFIG["symbol"],
             )
             if info and "result" in info and "list" in info["result"] and info["result"]["list"]:
                 self.min_qty = float(info["result"]["list"][0]["lotSizeFilter"]["minOrderQty"])
                 logger.info("Minimum order quantity updated", min_qty=self.min_qty)
         except Exception as e:
-            logger.error("Error updating minimum order quantity", error=str(e))
+            logger.exception("Error updating minimum order quantity")
 
-    async def place_limit_order(self, side, price, qty):
+    async def place_limit_order(self, side: str, price: float, qty: int) -> Optional[dict]:
         try:
             params = {
                 "category": Config.BYBIT_CONFIG.get("category", "inverse"),
@@ -172,17 +179,17 @@ class MMService:
                 "price": str(price),
                 "qty": str(qty),
                 "timeInForce": "GTC",
-                "leverage": "3"
+                "leverage": "3",
             }
             response = await asyncio.to_thread(self.session.place_order, **params)
             logger.info("Limit order placed", side=side, price=price, qty=qty, response=response)
             return response
         except Exception as e:
-            logger.error("Error placing limit order", side=side, price=price, qty=qty, error=str(e))
+            logger.exception("Error placing limit order", side=side, price=price, qty=qty)
             return None
 
     async def update_orders(self):
-        # If a position is open, manage it instead.
+        # If no position is open, update MM orders (limit orders are refreshed every 15 seconds).
         if self.inventory != 0:
             logger.info("Position open; managing open position with SL/TP orders.")
             await self.manage_open_position()
@@ -198,49 +205,59 @@ class MMService:
                 return
             midprice = float(latest_price)
             bid_price, ask_price = self.compute_bid_ask(midprice, self.inventory, self.baseline_sigma)
-            # Enforce that the effective spread (ask - bid) is at least 0.1% of the midprice.
-            min_delta = midprice * 0.001  # 0.1% of the current price
+
+            # Enforce minimum effective spread: at least 0.1% of current price.
+            min_delta = midprice * 0.001
             effective_spread = ask_price - bid_price
             if effective_spread < min_delta:
                 bid_price = midprice - (min_delta / 2)
                 ask_price = midprice + (min_delta / 2)
                 logger.info("Forcing minimum delta spread", bid_price=bid_price, ask_price=ask_price)
+
             equity = await self.get_portfolio_value()
             if equity <= 0:
                 logger.warning("No equity available for order sizing.")
                 return
+
             leverage = 3
             qty = round(equity * leverage * 0.35)
             if self.min_qty is not None and qty < self.min_qty:
                 qty = int(self.min_qty)
-            # Cancel any existing MM orders.
-            if self.current_bid_order_id:
-                await self.cancel_existing_order(self.current_bid_order_id)
-                self.current_bid_order_id = None
-            if self.current_ask_order_id:
-                await self.cancel_existing_order(self.current_ask_order_id)
-                self.current_ask_order_id = None
-            bid_response = await self.place_limit_order("Buy", bid_price, qty)
-            ask_response = await self.place_limit_order("Sell", ask_price, qty)
+
+            # Cancel existing MM orders concurrently.
+            await asyncio.gather(
+                self.cancel_existing_order(self.current_bid_order_id) if self.current_bid_order_id else asyncio.sleep(0),
+                self.cancel_existing_order(self.current_ask_order_id) if self.current_ask_order_id else asyncio.sleep(0),
+            )
+            self.current_bid_order_id = None
+            self.current_ask_order_id = None
+
+            bid_response, ask_response = await asyncio.gather(
+                self.place_limit_order("Buy", bid_price, qty),
+                self.place_limit_order("Sell", ask_price, qty),
+            )
             if bid_response and bid_response.get("result", {}).get("orderId"):
                 self.current_bid_order_id = bid_response["result"]["orderId"]
             if ask_response and ask_response.get("result", {}).get("orderId"):
                 self.current_ask_order_id = ask_response["result"]["orderId"]
+
             logger.info("Updated MM orders", bid_price=bid_price, ask_price=ask_price, order_qty=qty)
         except Exception as e:
-            logger.error("Error updating MM orders", error=str(e))
+            logger.exception("Error updating MM orders")
 
     async def manage_open_position(self):
-        # Cancel any outstanding MM orders.
-        if self.current_bid_order_id:
-            await self.cancel_existing_order(self.current_bid_order_id)
-            self.current_bid_order_id = None
-        if self.current_ask_order_id:
-            await self.cancel_existing_order(self.current_ask_order_id)
-            self.current_ask_order_id = None
+        # Cancel any existing MM orders.
+        await asyncio.gather(
+            self.cancel_existing_order(self.current_bid_order_id) if self.current_bid_order_id else asyncio.sleep(0),
+            self.cancel_existing_order(self.current_ask_order_id) if self.current_ask_order_id else asyncio.sleep(0),
+        )
+        self.current_bid_order_id = None
+        self.current_ask_order_id = None
+
         if self.entry_price is None or self.position_qty is None:
             logger.warning("Position details missing; cannot manage SL/TP orders.")
             return
+
         midprice = float(await Database.fetchval("SELECT close FROM candles ORDER BY time DESC LIMIT 1"))
         if self.inventory > 0:
             sl_price = self.entry_price * (1 - self.stop_loss_pct)
@@ -252,11 +269,15 @@ class MMService:
             exit_side = "Buy"
         else:
             return
+
         qty = self.position_qty
         if self.min_qty is not None and qty < self.min_qty:
             qty = int(self.min_qty)
-        sl_response = await self.place_limit_order(exit_side, sl_price, qty)
-        tp_response = await self.place_limit_order(exit_side, tp_price, qty)
+
+        sl_response, tp_response = await asyncio.gather(
+            self.place_limit_order(exit_side, sl_price, qty),
+            self.place_limit_order(exit_side, tp_price, qty),
+        )
         logger.info("Placed SL and TP orders", sl_price=sl_price, tp_price=tp_price, qty=qty)
 
     async def load_historical_data(self):
@@ -277,12 +298,16 @@ class MMService:
             self._historical_df = df
             logger.info("Historical data loaded for tuning", rows=len(df))
         except Exception as e:
-            logger.error("Error loading historical data for tuning", error=str(e))
+            logger.exception("Error loading historical data for tuning")
 
-    def simulate_mm_performance(self, gamma, k, baseline_sigma, refresh_rate, stop_loss_pct, take_profit_pct):
+    def simulate_mm_performance(
+        self, gamma: float, k: float, baseline_sigma: float,
+        refresh_rate: float, stop_loss_pct: float, take_profit_pct: float
+    ) -> float:
         if self._historical_df is None or self._historical_df.empty:
             logger.error("Historical data not loaded for simulation.")
             return 1e6
+
         df = self._historical_df.copy()
         df["log_return"] = np.log(df["close"] / df["close"].shift(1))
         df.dropna(inplace=True)
@@ -293,6 +318,7 @@ class MMService:
         position = 0  # 0: no position, 1: long, -1: short
         entry_price = None
         leverage = 3
+
         for idx, row in df_sim.iterrows():
             midprice = row["close"]
             risk_component = (gamma * (sigma ** 2) * self.T) / 2
@@ -303,16 +329,19 @@ class MMService:
             reservation_price = midprice - position * gamma * (sigma ** 2) * self.T
             bid = reservation_price - half_spread_adjusted
             ask = reservation_price + half_spread_adjusted
-            # Enforce minimum effective spread based on percentage: minimum delta of 0.1% of midprice.
+
+            # Enforce minimum effective spread: at least 0.1% of midprice.
             min_delta = midprice * 0.001
             if (ask - bid) < min_delta:
-                return 1e6  # Penalize parameters that yield a spread below the minimum delta.
+                return 1e6
+
             try:
                 order_qty = round(equity * leverage * 0.35)
             except OverflowError:
                 return 1e6
             if not np.isfinite(order_qty):
                 return 1e6
+
             if position == 0:
                 if row["low"] <= bid:
                     position = 1
@@ -362,6 +391,7 @@ class MMService:
                         return 1e6
                     position = 0
                     entry_price = None
+
         if position != 0 and entry_price is not None:
             final_price = df_sim["close"].iloc[-1]
             if position == 1:
@@ -369,6 +399,7 @@ class MMService:
             else:
                 profit = order_qty * (entry_price - final_price)
             equity += profit
+
         loss = -(equity - 1000.0)
         return loss
 
@@ -376,6 +407,7 @@ class MMService:
         def __init__(self, simulation_fn, **kwargs):
             self.simulation_fn = simulation_fn
             super().__init__(objective="loss", max_trials=10, executions_per_trial=1, **kwargs)
+
         def run_trial(self, trial, *args, **kwargs):
             hp = trial.hyperparameters
             gamma = hp.Float("gamma", 0.01, 0.5, sampling="log", default=0.1)
@@ -396,7 +428,7 @@ class MMService:
             directory="mm_tuner_dir",
             project_name="mm_parameter_tuning"
         )
-        tuner.search(x=np.zeros((1, 1)), y=np.zeros((1,)))
+        tuner.search(x=np.zeros((1, 1)), y=np.zeros((1,)), validation_split=0.2)
         best_hp = tuner.get_best_hyperparameters(num_trials=1)[0]
         self.gamma = best_hp.get("gamma")
         self.k = best_hp.get("k")
@@ -404,36 +436,47 @@ class MMService:
         self.refresh_rate = best_hp.get("refresh_rate")
         self.stop_loss_pct = best_hp.get("stop_loss_pct")
         self.take_profit_pct = best_hp.get("take_profit_pct")
-        logger.info("ML-based parameter tuning complete",
-                    best_gamma=self.gamma,
-                    best_k=self.k,
-                    baseline_sigma=self.baseline_sigma,
-                    refresh_rate=self.refresh_rate,
-                    stop_loss_pct=self.stop_loss_pct,
-                    take_profit_pct=self.take_profit_pct)
+        logger.info(
+            "ML-based parameter tuning complete",
+            best_gamma=self.gamma,
+            best_k=self.k,
+            baseline_sigma=self.baseline_sigma,
+            refresh_rate=self.refresh_rate,
+            stop_loss_pct=self.stop_loss_pct,
+            take_profit_pct=self.take_profit_pct,
+        )
 
-    async def run(self, update_interval=None):
+    async def run(self, update_interval: Optional[int] = None):
         self.running = True
         await self.tune_parameters_ml()
-        interval = update_interval if update_interval is not None else self.refresh_rate or 60
+        # Set distinct rates: position is checked every 1 second; limit orders refreshed every 15 seconds.
+        position_check_interval = 1  # seconds
+        limit_refresh_rate = 15      # seconds
+        last_limit_update = 0
+        loop = asyncio.get_running_loop()
         while self.running:
+            current_time = loop.time()
             if self.inventory != 0:
                 logger.info("Position open; managing open position with SL/TP orders.")
                 await self.manage_open_position()
             else:
-                await self.update_orders()
-            await asyncio.sleep(interval)
+                if current_time - last_limit_update >= limit_refresh_rate:
+                    await self.update_orders()
+                    last_limit_update = current_time
+            await asyncio.sleep(position_check_interval)
 
     async def manage_open_position(self):
-        if self.current_bid_order_id:
-            await self.cancel_existing_order(self.current_bid_order_id)
-            self.current_bid_order_id = None
-        if self.current_ask_order_id:
-            await self.cancel_existing_order(self.current_ask_order_id)
-            self.current_ask_order_id = None
+        await asyncio.gather(
+            self.cancel_existing_order(self.current_bid_order_id) if self.current_bid_order_id else asyncio.sleep(0),
+            self.cancel_existing_order(self.current_ask_order_id) if self.current_ask_order_id else asyncio.sleep(0),
+        )
+        self.current_bid_order_id = None
+        self.current_ask_order_id = None
+
         if self.entry_price is None or self.position_qty is None:
             logger.warning("Position details missing; cannot manage SL/TP orders.")
             return
+
         midprice = float(await Database.fetchval("SELECT close FROM candles ORDER BY time DESC LIMIT 1"))
         if self.inventory > 0:
             sl_price = self.entry_price * (1 - self.stop_loss_pct)
@@ -445,19 +488,23 @@ class MMService:
             exit_side = "Buy"
         else:
             return
+
         qty = self.position_qty
         if self.min_qty is not None and qty < self.min_qty:
             qty = int(self.min_qty)
-        sl_response = await self.place_limit_order(exit_side, sl_price, qty)
-        tp_response = await self.place_limit_order(exit_side, tp_price, qty)
+
+        sl_response, tp_response = await asyncio.gather(
+            self.place_limit_order(exit_side, sl_price, qty),
+            self.place_limit_order(exit_side, tp_price, qty),
+        )
         logger.info("Placed SL and TP orders", sl_price=sl_price, tp_price=tp_price, qty=qty)
 
     async def stop(self):
         self.running = False
-        if self.current_bid_order_id:
-            await self.cancel_existing_order(self.current_bid_order_id)
-        if self.current_ask_order_id:
-            await self.cancel_existing_order(self.current_ask_order_id)
+        await asyncio.gather(
+            self.cancel_existing_order(self.current_bid_order_id) if self.current_bid_order_id else asyncio.sleep(0),
+            self.cancel_existing_order(self.current_ask_order_id) if self.current_ask_order_id else asyncio.sleep(0),
+        )
         logger.info("MMService stopped.")
 
 

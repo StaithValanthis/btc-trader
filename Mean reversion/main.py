@@ -1,6 +1,5 @@
-# main.py
 import asyncio
-from app import TradingBot
+from app.init import TradingBot
 
 async def main():
     bot = TradingBot()
