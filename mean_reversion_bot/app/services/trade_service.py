@@ -1,24 +1,21 @@
-# app/services/trade_service.py
+# File: app/services/trade_service.py
 
 import asyncio
 import pandas as pd
 import ta
 from pybit.unified_trading import HTTP
 
-from app.core.database import Database
 from app.core.config import Config
-from app.core.logger import get_logger
-
-logger = get_logger(__name__)
+from app.utils.logger import logger
 
 class TradeService:
     """
-    Mean-reversion per‐symbol using BB + RSI + dynamic position sizing based on % risk.
+    Mean-reversion per-symbol using BB + RSI + dynamic position sizing based on % risk.
+    Operates in event-driven mode: reacts to each new 1-min candle immediately.
     """
 
-    def __init__(self, symbol: str, db_pool):
+    def __init__(self, symbol: str):
         self.symbol       = symbol
-        self.db           = db_pool
         self.cfg          = Config.TRADING_CONFIG
         self.bb_window    = self.cfg['BB_WINDOW']
         self.bb_dev       = self.cfg['BB_DEV']
@@ -35,16 +32,20 @@ class TradeService:
         self.current_pos  = None   # 'long' or 'short'
         self.entry_price  = None
 
-        # in-memory buffer of the last N candles
+        # in-memory buffer of recent candles
         self.candles      = pd.DataFrame()
 
-    async def initialize(self):
+    async def initialize(self) -> bool:
+        """
+        Initialize REST session, fetch instrument filters, and set leverage.
+        Returns False if symbol should be skipped.
+        """
         # 1) REST session
         self.session = HTTP(
-            testnet   = Config.BYBIT_CONFIG['testnet'],
-            api_key   = Config.BYBIT_CONFIG['api_key'],
-            api_secret= Config.BYBIT_CONFIG['api_secret'],
-            recv_window=5000,
+            testnet     = Config.BYBIT_CONFIG['testnet'],
+            api_key     = Config.BYBIT_CONFIG['api_key'],
+            api_secret  = Config.BYBIT_CONFIG['api_secret'],
+            recv_window = 5000,
         )
 
         # 2) Instrument info → tick & lot size
@@ -59,40 +60,40 @@ class TradeService:
             lf   = inst['lotSizeFilter']
             self.tick_size = float(pf['tickSize'])
             self.lot_size  = float(lf['qtyStep'])
-
         except Exception as e:
+            # Skip completely if symbol is invalid
             if "symbol invalid" in str(e).lower():
-                logger.warning("Skipping invalid symbol %s: %s", self.symbol, e,
-                               extra={"event":"Skipping invalid symbol"})
-                return
+                logger.warning("Skipping invalid symbol", symbol=self.symbol, error=str(e))
+                return False
             raise
 
-        # 3) Set leverage
-        await asyncio.to_thread(
-            self.session.set_leverage,
-            category   = Config.BYBIT_CONFIG['category'],
-            symbol     = self.symbol,
-            buy_leverage = self.leverage,
-            sell_leverage= self.leverage,
-        )
-
-        # 4) Load any existing position from DB
-        row = await Database.fetchrow(
-            "SELECT side, size FROM positions WHERE symbol=$1",
-            self.symbol
-        )
-        if row:
-            self.current_pos = row['side']
-            # you could also load an entry_price if you store that
+        # 3) Set leverage (skip symbol if leverage call fails)
+        try:
+            await asyncio.to_thread(
+                self.session.set_leverage,
+                category      = Config.BYBIT_CONFIG['category'],
+                symbol        = self.symbol,
+                buy_leverage  = self.leverage,
+                sell_leverage = self.leverage,
+            )
+        except Exception as e:
+            logger.warning(
+                "Skipping symbol; leverage not supported",
+                symbol=self.symbol, error=str(e)
+            )
+            return False
 
         logger.info(
-            "TradeService initialized for %s (tick=%s lot=%s lev=%s)",
-            self.symbol, self.tick_size, self.lot_size, self.leverage,
-            extra={"event":"initialized"}
+            "TradeService initialized",
+            symbol=self.symbol,
+            tick_size=self.tick_size,
+            lot_size=self.lot_size,
+            leverage=self.leverage
         )
+        return True
 
     async def on_candle(self, candle: dict):
-        # append the new candle
+        # append the new candle to our buffer
         df = pd.DataFrame([{
             'time':   pd.to_datetime(candle['startTime'], unit='ms'),
             'open':   float(candle['open']),
@@ -107,16 +108,20 @@ class TradeService:
         if len(self.candles) < self.bb_window:
             return
 
-        # BB & RSI
-        bb   = ta.volatility.BollingerBands(self.candles['close'],
-                                            window=self.bb_window,
-                                            window_dev=self.bb_dev)
+        # compute BB & RSI
+        bb = ta.volatility.BollingerBands(
+            close=self.candles['close'],
+            window=self.bb_window,
+            window_dev=self.bb_dev
+        )
         self.candles['mid']   = bb.bollinger_mavg()
         self.candles['upper'] = bb.bollinger_hband()
         self.candles['lower'] = bb.bollinger_lband()
 
-        rsi  = ta.momentum.RSIIndicator(self.candles['close'],
-                                        window=self.rsi_long)
+        rsi = ta.momentum.RSIIndicator(
+            close=self.candles['close'],
+            window=self.rsi_long
+        )
         self.candles['rsi'] = rsi.rsi()
 
         cur   = self.candles.iloc[-1]
@@ -126,14 +131,14 @@ class TradeService:
         lower = float(cur['lower'])
         r     = float(cur['rsi'])
 
-        # signal
+        # determine entry signal
         signal = None
         if price < lower and r < self.rsi_long:
             signal = 'long'
         elif price > upper and r > self.rsi_short:
             signal = 'short'
 
-        # exit logic
+        # exit on mid‐band or stop‐loss
         if self.current_pos == 'long':
             stop_price = self.entry_price * (1 - self.sl_pct)
             if price >= mid or price <= stop_price:
@@ -144,14 +149,15 @@ class TradeService:
             if price <= mid or price >= stop_price:
                 await self._exit(price)
 
-        # entry logic
+        # entry
         elif not self.current_pos and signal:
             await self._enter(signal, price)
 
     async def _enter(self, side: str, price: float):
-        # 1) compute risk‐based qty
+        # compute risk‐based qty
         bal = await asyncio.to_thread(
-            self.session.get_wallet_balance, accountType="UNIFIED"
+            self.session.get_wallet_balance,
+            accountType="UNIFIED"
         )
         acct = bal["result"]["list"][0]["coin"]
         equity = next(
@@ -160,76 +166,70 @@ class TradeService:
         )
         risk_amount = equity * self.risk_pct
 
-        if side=='long':
-            stop_price = price * (1 - self.sl_pct)
-        else:
-            stop_price = price * (1 + self.sl_pct)
-
-        unit_risk = abs(price - stop_price) or self.lot_size
+        stop_price = price * (1 - self.sl_pct) if side=='long' else price * (1 + self.sl_pct)
+        unit_risk  = abs(price - stop_price) or self.lot_size
         qty = max(risk_amount / unit_risk, self.lot_size)
-        # round down to lot_size multiples
-        qty = (int(qty // self.lot_size)) * self.lot_size
+        qty = (int(qty // self.lot_size)) * self.lot_size  # round down
 
         resp = await asyncio.to_thread(
             self.session.place_active_order,
-            category = Config.BYBIT_CONFIG['category'],
-            symbol   = self.symbol,
-            side     = 'Buy' if side=='long' else 'Sell',
-            orderType= 'Market',
-            qty      = str(qty),
-            leverage = str(self.leverage),
+            category  = Config.BYBIT_CONFIG['category'],
+            symbol    = self.symbol,
+            side      = 'Buy' if side=='long' else 'Sell',
+            orderType = 'Market',
+            qty       = str(qty),
+            leverage  = str(self.leverage),
         )
 
         if resp.get('retCode') == 0:
             self.current_pos = side
             self.entry_price = price
-            logger.info("Entered %s @ %s (qty=%s)", side, price, qty,
-                        extra={"event":"enter","symbol":self.symbol})
+            logger.info(
+                "Entered",
+                symbol=self.symbol, side=side, price=price, qty=qty, event="enter"
+            )
         else:
-            logger.error("Entry failed %s", resp,
-                         extra={"event":"enter_error","symbol":self.symbol})
+            logger.error(
+                "Entry failed",
+                symbol=self.symbol, response=resp, event="enter_error"
+            )
 
     async def _exit(self, price: float):
-        # opposite side
         side = 'Sell' if self.current_pos=='long' else 'Buy'
-
         resp = await asyncio.to_thread(
             self.session.place_active_order,
-            category = Config.BYBIT_CONFIG['category'],
-            symbol   = self.symbol,
-            side     = side,
-            orderType= 'Market',
-            # omit qty to close full
-            leverage = str(self.leverage),
+            category  = Config.BYBIT_CONFIG['category'],
+            symbol    = self.symbol,
+            side      = side,
+            orderType = 'Market',
+            leverage  = str(self.leverage),
         )
 
         if resp.get('retCode') == 0:
-            logger.info("Exited %s @ %s", self.current_pos, price,
-                        extra={"event":"exit","symbol":self.symbol})
+            logger.info(
+                "Exited",
+                symbol=self.symbol, side=self.current_pos, price=price, event="exit"
+            )
             self.current_pos = None
             self.entry_price = None
         else:
-            logger.error("Exit failed %s", resp,
-                         extra={"event":"exit_error","symbol":self.symbol})
+            logger.error(
+                "Exit failed",
+                symbol=self.symbol, response=resp, event="exit_error"
+            )
 
     async def on_trade(self, trade: dict):
-        # record fills & update your positions table as needed
-        # e.g.
-        # await Database.execute(
-        #    "INSERT INTO fills (...) VALUES (...)",
-        #    ...
-        # )
+        # Optional: record fills into your DB and update positions table
         pass
 
     async def run(self, ws):
-        # subscribe & dispatch
         await ws.subscribe([
             f"candle.1.{self.symbol}",
             f"trade.100ms.{self.symbol}",
         ])
         async for msg in ws:
-            topic = msg.get("topic","")
-            data  = msg.get("data",{})
+            topic = msg.get("topic", "")
+            data  = msg.get("data", {})
             if topic.startswith("candle."):
                 await self.on_candle(data)
             elif topic.startswith("trade."):
@@ -238,4 +238,4 @@ class TradeService:
                 logger.debug("Ignored message", topic=topic)
 
     def stop(self):
-        logger.info("Stopping", symbol=self.symbol)
+        logger.info("Stopping TradeService", symbol=self.symbol)

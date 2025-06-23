@@ -22,7 +22,7 @@ class Database:
                     # Enable TimescaleDB
                     await conn.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;')
 
-                    # market_data with symbol
+                    # market_data hypertable
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS market_data (
                             symbol TEXT NOT NULL,
@@ -41,7 +41,7 @@ class Database:
                         );
                     ''')
 
-                    # candles with symbol
+                    # candles hypertable
                     await conn.execute('''
                         CREATE TABLE IF NOT EXISTS candles (
                             symbol TEXT NOT NULL,
@@ -59,6 +59,29 @@ class Database:
                             'candles', 'time',
                             if_not_exists => TRUE,
                             chunk_time_interval => INTERVAL '1 day'
+                        );
+                    ''')
+
+                    # positions (track open position per symbol)
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS positions (
+                            symbol   TEXT         PRIMARY KEY,
+                            side     TEXT         NOT NULL,    -- 'long' or 'short'
+                            size     DOUBLE PRECISION NOT NULL,
+                            entry_ts TIMESTAMPTZ  NOT NULL,
+                            entry_px DOUBLE PRECISION NOT NULL
+                        );
+                    ''')
+
+                    # fills (record individual fills)
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS fills (
+                            id     SERIAL        PRIMARY KEY,
+                            symbol TEXT          NOT NULL,
+                            side   TEXT          NOT NULL,
+                            qty    DOUBLE PRECISION NOT NULL,
+                            price  DOUBLE PRECISION NOT NULL,
+                            ts     TIMESTAMPTZ   NOT NULL DEFAULT NOW()
                         );
                     ''')
 
