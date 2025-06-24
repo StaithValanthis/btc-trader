@@ -10,7 +10,7 @@ from app.services.candle_service import CandleService
 from app.services.trade_service import TradeService
 from app.debug.startup_check import StartupChecker
 from app.core.config import Config
-from app.utils.symbols import fetch_top_symbols
+from app.utils.symbols import fetch_top_symbols, filter_tradable_symbols
 
 logger = get_logger(__name__)
 
@@ -37,9 +37,14 @@ class TradingBot:
             initial = Config.TRADING_CONFIG["symbols"]
             logger.info("Testnet mode: using default symbols", symbols=initial)
         else:
-            # mainnet: fetch the top 30 by volume
-            initial = await asyncio.to_thread(fetch_top_symbols, 30)
-            logger.info("Mainnet mode: fetched top symbols by volume", symbols=initial)
+            # mainnet: fetch the top 30 by volume, then filter for tradable perps
+            syms = await fetch_top_symbols(30)
+            tradable_syms = await filter_tradable_symbols(
+                syms,
+                Config.TRADING_CONFIG['leverage']
+            )
+            initial = tradable_syms
+            logger.info("Mainnet mode: filtered top tradable perps", symbols=initial)
 
         await self._update_symbols(initial)
 
@@ -74,9 +79,13 @@ class TradingBot:
         """Every `interval_s` seconds, re‐fetch top symbols and reconcile."""
         while self.running:
             try:
-                new_syms = await asyncio.to_thread(fetch_top_symbols, 30)
-                logger.info("Hourly refresh: fetched top symbols by volume", symbols=new_syms)
-                await self._update_symbols(new_syms)
+                syms = await fetch_top_symbols(30)
+                tradable_syms = await filter_tradable_symbols(
+                    syms,
+                    Config.TRADING_CONFIG['leverage']
+                )
+                logger.info("Hourly refresh: filtered top tradable perps", symbols=tradable_syms)
+                await self._update_symbols(tradable_syms)
             except Exception as e:
                 logger.warning("Failed to refresh symbols", error=str(e))
             await asyncio.sleep(interval_s)
@@ -111,7 +120,6 @@ class TradingBot:
         Config.TRADING_CONFIG['symbols'] = new_symbols
         logger.info("Updated active symbols", symbols=new_symbols)
 
-
 # no change to this helper — only called from the mainnet branches above
 async def _fetch_top_30() -> list[str]:
-    return await asyncio.to_thread(fetch_top_symbols, 30)
+    return await fetch_top_symbols(30)
