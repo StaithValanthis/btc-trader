@@ -1,5 +1,3 @@
-# File: app/services/trade_service.py
-
 import asyncio
 import pandas as pd
 import ta
@@ -89,27 +87,43 @@ class TradeService:
         except Exception as e:
             logger.warning("Could not determine position mode, defaulting to OneWay", symbol=self.symbol, error=str(e))
 
-        # 4) Try to set leverage; only send position_idx for non-linear categories
+        # 4) Only check/set leverage if there’s an existing position record
         try:
-            params = dict(
-                category      = Config.BYBIT_CONFIG['category'],
-                symbol        = self.symbol,
-                buy_leverage  = self.leverage,
-                sell_leverage = self.leverage
+            pos_info = await asyncio.to_thread(
+                self.session.get_positions,
+                category=Config.BYBIT_CONFIG['category'],
+                symbol=self.symbol
             )
-            # Do NOT send position_idx for linear contracts on mainnet
-            if Config.BYBIT_CONFIG['category'] != 'linear':
-                params['position_idx'] = self.position_idx
-            await asyncio.to_thread(
-                self.session.set_leverage,
-                **params
-            )
+            pos_list = pos_info.get('result', {}).get('list', [])
+            if not pos_list:
+                logger.info("No existing position for symbol; skipping leverage check/set", symbol=self.symbol)
+            else:
+                current_leverage = float(pos_list[0].get('leverage', 0))
+                if int(current_leverage) == int(self.leverage):
+                    logger.info("Leverage already set, skipping set_leverage", symbol=self.symbol, leverage=self.leverage)
+                else:
+                    params = dict(
+                        category      = Config.BYBIT_CONFIG['category'],
+                        symbol        = self.symbol,
+                        buy_leverage  = self.leverage,
+                        sell_leverage = self.leverage
+                    )
+                    resp = await asyncio.to_thread(self.session.set_leverage, **params)
+                    if resp.get("retCode") == 10001:
+                        logger.warning(
+                            "Leverage not adjustable for symbol; trading with default leverage.",
+                            symbol=self.symbol
+                        )
+                    elif resp.get("retCode", 0) != 0:
+                        logger.error(
+                            "Unknown error setting leverage; skipping.",
+                            symbol=self.symbol, response=resp
+                        )
+                        return False
+                    else:
+                        logger.info("Set leverage for symbol", symbol=self.symbol, leverage=self.leverage)
         except Exception as e:
-            logger.warning(
-                "Skipping symbol; leverage not supported",
-                symbol=self.symbol, error=str(e)
-            )
-            return False
+            logger.warning("Leverage check/set failed; continuing with default.", symbol=self.symbol, error=str(e))
 
         logger.info(
             "TradeService initialized",
@@ -133,7 +147,6 @@ class TradeService:
             }]).set_index('time')
 
             self.candles = pd.concat([self.candles, df]).iloc[-self.bb_window*3:]
-
             if len(self.candles) < self.bb_window:
                 return
 
@@ -167,7 +180,7 @@ class TradeService:
             elif price > upper and r > self.rsi_short:
                 signal = 'short'
 
-            # exit on mid‐band or stop‐loss
+            # exit on mid-band or stop-loss
             if self.current_pos == 'long':
                 stop_price = self.entry_price * (1 - self.sl_pct)
                 if price >= mid or price <= stop_price:
@@ -203,10 +216,20 @@ class TradeService:
                 return
             risk_amount = equity * self.risk_pct
 
-            stop_price = price * (1 - self.sl_pct) if side == 'long' else price * (1 + self.sl_pct)
-            unit_risk  = abs(price - stop_price) or self.lot_size
-            qty = max(risk_amount / unit_risk, self.lot_size)
-            qty = (int(qty // self.lot_size)) * self.lot_size  # round down
+            # leverage-aware sizing
+            stop_price     = price * (1 - self.sl_pct) if side == 'long' else price * (1 + self.sl_pct)
+            stop_loss_dist = abs(price - stop_price)
+            if stop_loss_dist == 0:
+                logger.error("Invalid stop loss distance, cannot size order", symbol=self.symbol)
+                return
+
+            pos_size = risk_amount * self.leverage / (stop_loss_dist / price)
+            qty      = max(pos_size, self.lot_size)
+            qty      = (int(qty // self.lot_size)) * self.lot_size
+
+            if qty < self.lot_size:
+                logger.warning("Order qty below min lot size, skipping", symbol=self.symbol, qty=qty)
+                return
 
             resp = await asyncio.to_thread(
                 self.session.place_active_order,
@@ -215,21 +238,14 @@ class TradeService:
                 side      = 'Buy' if side == 'long' else 'Sell',
                 orderType = 'Market',
                 qty       = str(qty),
-                leverage  = str(self.leverage),
             )
 
             if resp.get('retCode') == 0:
                 self.current_pos = side
                 self.entry_price = price
-                logger.info(
-                    "Entered",
-                    symbol=self.symbol, side=side, price=price, qty=qty, event="enter"
-                )
+                logger.info("Entered", symbol=self.symbol, side=side, price=price, qty=qty, event="enter")
             else:
-                logger.error(
-                    "Entry failed",
-                    symbol=self.symbol, response=resp, event="enter_error"
-                )
+                logger.error("Entry failed", symbol=self.symbol, response=resp, event="enter_error")
         except Exception as e:
             logger.exception("TradeService _enter error", symbol=self.symbol, error=str(e))
 
@@ -242,21 +258,14 @@ class TradeService:
                 symbol    = self.symbol,
                 side      = side,
                 orderType = 'Market',
-                leverage  = str(self.leverage),
             )
 
             if resp.get('retCode') == 0:
-                logger.info(
-                    "Exited",
-                    symbol=self.symbol, side=self.current_pos, price=price, event="exit"
-                )
+                logger.info("Exited", symbol=self.symbol, side=self.current_pos, price=price, event="exit")
                 self.current_pos = None
                 self.entry_price = None
             else:
-                logger.error(
-                    "Exit failed",
-                    symbol=self.symbol, response=resp, event="exit_error"
-                )
+                logger.error("Exit failed", symbol=self.symbol, response=resp, event="exit_error")
         except Exception as e:
             logger.exception("TradeService _exit error", symbol=self.symbol, error=str(e))
 
@@ -265,7 +274,6 @@ class TradeService:
         pass
 
     async def run(self, ws):
-        # Subscribe to candle/trade topics for this symbol
         await ws.subscribe([
             f"candle.1.{self.symbol}",
             f"trade.100ms.{self.symbol}",
