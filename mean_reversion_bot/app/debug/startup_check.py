@@ -74,7 +74,7 @@ class StartupChecker:
         for s in Config.TRADING_CONFIG['symbols']:
             try:
                 resp = session.get_instruments_info(
-                    category=Config.BYBIT_CONFIG.get('category', 'linear'),
+                    category=Config.BYBIT_CONFIG.get('category', 'LinearPerpetual'),
                     symbol=s
                 )
                 if resp.get('retCode', 0) == 0:
