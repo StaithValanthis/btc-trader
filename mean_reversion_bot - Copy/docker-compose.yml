@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: timescale/timescaledb:2.13.0-pg14
+    environment:
+      POSTGRES_DB: trading_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trading_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  trader-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+    volumes:
+      - ./:/app
+    restart: unless-stopped
+
+  backtester:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    command: python3 scripts/backtester.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+    volumes:
+      - ./:/app
+    restart: "no"
+
+  monte-carlo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    command: python3 scripts/monte_carlo.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+    volumes:
+      - ./:/app
+    restart: "no"
+
+  live-tuner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    command: python3 scripts/live_tuner.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+    volumes:
+      - ./:/app
+    restart: unless-stopped
+
+volumes:
+  timescaledb-data:
+
+networks:
+  default:
+    driver: bridge

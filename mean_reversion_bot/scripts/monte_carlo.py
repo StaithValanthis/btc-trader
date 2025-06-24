@@ -1,39 +1,24 @@
 #!/usr/bin/env python3
-"""
-Monte Carlo sampler for BB+RSI+SL mean reversion.
-"""
-import random
-import pandas as pd
-import asyncio
-from scripts.backtester import fetch_candles, simulate
+import random, asyncio, pandas as pd
+from scripts.backtester import fetch, compute
 from app.core.config import Config
 
 async def main():
-    df = await fetch_candles(limit=5000)
-    mc     = Config.PARAM_RANGES['MC_TRIALS']
-    ranges = Config.PARAM_RANGES
-    sls    = ranges['SL_PCT']
-
-    results = []
+    df=await fetch(None,5000)
+    mc=Config["PARAM_RANGES"]["MC_TRIALS"]
+    rng=Config["PARAM_RANGES"]["MC_RANGE"]
+    sls=Config["PARAM_RANGES"]["SL_PCT"]
+    results=[]
     for _ in range(mc):
-        w  = random.randint(*ranges['MC_RANGE']['window'])
-        d  = round(random.uniform(*ranges['MC_RANGE']['dev']), 2)
-        rl = random.randint(*ranges['MC_RANGE']['rsi_long'])
-        rs = random.randint(*ranges['MC_RANGE']['rsi_short'])
-        sl = random.choice(sls)
-        m  = simulate(df, w, d, rl, rs, sl)
-        results.append({
-            'window':    w,
-            'dev':       d,
-            'rsi_long':  rl,
-            'rsi_short': rs,
-            'sl_pct':    sl,
-            'pnl':       m['pnl'],
-            'sharpe':    m['sharpe']
-        })
+        w=random.randint(*rng["window"])
+        d=round(random.uniform(*rng["dev"]),2)
+        rl=random.randint(*rng["rsi_long"])
+        rs=random.randint(*rng["rsi_short"])
+        sl=random.choice(sls)
+        m=compute(df,(w,d,rl,rs,sl))
+        results.append({"window":w,"dev":d,"rsi_long":rl,"rsi_short":rs,"sl_pct":sl,**m})
+    out=pd.DataFrame(results).sort_values(["sharpe","pnl"],ascending=False).head(10)
+    print(out)
 
-    df_out = pd.DataFrame(results).sort_values(['sharpe','pnl'], ascending=False).head(10)
-    print(df_out)
-
-if __name__ == '__main__':
+if __name__=="__main__":
     asyncio.run(main())

@@ -1,42 +1,46 @@
-#!/usr/bin/env python3
 import asyncio
-
 from app.core.config import Config
-from app.utils.logger import logger
-from app.services.trade_service import TradeService
-from app.core.bybit_ws import BybitWebSocket
-from app.utils.symbols import fetch_top_symbols
+from app.debug.startup_check import run_startup
+from app.core.bybit_ws    import start_bybit_ws, ws_url
+from app.services.candle_service import run_candle_aggregator
+from app.services.trade_service  import on_candle_msg
 
 async def main():
-    is_testnet = Config.BYBIT_CONFIG["testnet"]
+    pool = await run_startup()
+    symbols = Config["TRADING"]["symbols"]
+    from app.utils.symbols import fetch_top_symbols, filter_tradable
+    if not Config["BYBIT"]["testnet"]:
+        syms = await fetch_top_symbols(30)
+        symbols = await filter_tradable(syms,Config["TRADING"]["leverage"])
 
-    if is_testnet:
-        symbols = Config.TRADING_CONFIG["symbols"]
-        logger.info("Testnet mode: using default symbols", symbols=symbols)
-    else:
-        symbols = await fetch_top_symbols(
-            n=30
-        )
-        logger.info("Mainnet mode: fetched top symbols by volume", symbols=symbols)
+    # prepare per-symbol state and handlers
+    state_map = {}
+    for sym in symbols:
+        http = HTTP(**Config["BYBIT"])
+        inst = await asyncio.to_thread(http.get_instruments_info,category=Config["BYBIT"]["category"],symbol=sym)
+        pf = inst["result"]["list"][0]["priceFilter"]
+        lf = inst["result"]["list"][0]["lotSizeFilter"]
+        state_map[sym] = {
+            "session": http,
+            "symbol": sym,
+            "cfg":     Config["TRADING"],
+            "tick_size": float(pf["tickSize"]),
+            "lot_size":  float(lf["qtyStep"]),
+            "current_pos": None,
+            "entry_price": None,
+            "buf": pd.DataFrame()
+        }
+        asyncio.create_task(run_candle_aggregator(pool,sym))
 
-    async with BybitWebSocket() as ws:
-        services = []
+    async def handler(msg):
+        topic = msg.get("topic","")
+        for sym,st in state_map.items():
+            if topic==f"candle.1.{sym}":
+                await on_candle_msg(st,msg["data"])
 
-        for sym in symbols:
-            svc = TradeService(sym)
-            await svc.initialize()
-            if svc.session and svc.tick_size is not None:
-                await svc.run(ws)
-                services.append(svc)
-            else:
-                logger.warning("TradeService init failed; skipping symbol", symbol=sym)
+    # subscribe to all candle streams
+    topics = [f"candle.1.{s}" for s in symbols]
+    await start_bybit_ws(topics, handler)
 
-        if not services:
-            logger.error("No valid symbols to trade—exiting")
-            return
-
-        while True:
-            await asyncio.sleep(10)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())

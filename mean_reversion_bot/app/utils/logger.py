@@ -1,29 +1,18 @@
-import structlog
-import logging
-import os
+import structlog, logging, os
 
-def configure_logger():
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-
+def configure():
+    lvl = os.getenv("LOG_LEVEL","INFO").upper()
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer(ensure_ascii=False),
+            structlog.processors.JSONRenderer()
         ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
+        wrapper_class=structlog.stdlib.BoundLogger
     )
+    logging.basicConfig(level=lvl,format="%(message)s")
 
-    logging.basicConfig(
-        format="%(message)s",
-        level=log_level,
-        handlers=[logging.StreamHandler()]
-    )
-
-configure_logger()
+configure()
 logger = structlog.get_logger()
