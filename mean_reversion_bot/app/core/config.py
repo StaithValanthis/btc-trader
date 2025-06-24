@@ -24,7 +24,7 @@ class Config:
         'api_key':    os.getenv('BYBIT_API_KEY', ''),
         'api_secret': os.getenv('BYBIT_API_SECRET', ''),
         'testnet':    parse_bool(os.getenv('BYBIT_TESTNET', 'false')),
-        'category':   os.getenv('BYBIT_CATEGORY', 'LinearPerpetual')  # linear = USDT‐margined
+        'category':   os.getenv('BYBIT_CATEGORY', 'linear')  # linear = USDT‐margined
     }
 
     # Trading config: symbols + MR params + stop-loss + risk per trade
