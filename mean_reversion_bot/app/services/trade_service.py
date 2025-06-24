@@ -89,7 +89,7 @@ class TradeService:
         except Exception as e:
             logger.warning("Could not determine position mode, defaulting to OneWay", symbol=self.symbol, error=str(e))
 
-        # 4) Try to set leverage; skip if fails
+        # 4) Try to set leverage; only send position_idx for non-linear categories
         try:
             params = dict(
                 category      = Config.BYBIT_CONFIG['category'],
@@ -97,7 +97,7 @@ class TradeService:
                 buy_leverage  = self.leverage,
                 sell_leverage = self.leverage
             )
-            # Only send position_idx if not linear
+            # Do NOT send position_idx for linear contracts on mainnet
             if Config.BYBIT_CONFIG['category'] != 'linear':
                 params['position_idx'] = self.position_idx
             await asyncio.to_thread(
