@@ -28,6 +28,7 @@ class TradeService:
         self.session      = None
         self.tick_size    = None
         self.lot_size     = None
+        self.position_idx = 0
 
         self.current_pos  = None   # 'long' or 'short'
         self.entry_price  = None
@@ -55,26 +56,53 @@ class TradeService:
                 category=Config.BYBIT_CONFIG['category'],
                 symbol=self.symbol
             )
-            inst = info['result']['list'][0]
-            pf   = inst['priceFilter']
-            lf   = inst['lotSizeFilter']
+            inst_list = info.get('result', {}).get('list', [])
+            if not inst_list:
+                logger.warning("Skipping: symbol not found in Bybit instruments", symbol=self.symbol)
+                return False
+            inst = inst_list[0]
+            if inst.get('status') != 'Trading':
+                logger.warning("Skipping: symbol not trading", symbol=self.symbol)
+                return False
+            pf = inst['priceFilter']
+            lf = inst['lotSizeFilter']
             self.tick_size = float(pf['tickSize'])
             self.lot_size  = float(lf['qtyStep'])
-        except (KeyError, IndexError) as e:
-            logger.warning("Skipping invalid symbol", symbol=self.symbol, error=str(e))
-            return False
         except Exception as e:
             logger.error("Instrument info fetch failed", symbol=self.symbol, error=str(e))
             return False
 
-        # 3) Set leverage
+        # 3) Determine position mode if possible
+        self.position_idx = 0  # Default OneWay
         try:
-            await asyncio.to_thread(
-                self.session.set_leverage,
+            acct_info = await asyncio.to_thread(
+                self.session.get_account_info,
+                accountType="UNIFIED"
+            )
+            acct_list = acct_info.get('result', {}).get('list')
+            if acct_list and isinstance(acct_list, list) and len(acct_list) > 0:
+                mode = acct_list[0].get("positionMode", "OneWay")
+                self.position_idx = 0 if mode == "OneWay" else 1
+                logger.info("Account position mode", symbol=self.symbol, position_mode=mode, position_idx=self.position_idx)
+            else:
+                logger.warning("No position mode info, using default OneWay", symbol=self.symbol)
+        except Exception as e:
+            logger.warning("Could not determine position mode, defaulting to OneWay", symbol=self.symbol, error=str(e))
+
+        # 4) Try to set leverage; skip if fails
+        try:
+            params = dict(
                 category      = Config.BYBIT_CONFIG['category'],
                 symbol        = self.symbol,
                 buy_leverage  = self.leverage,
-                sell_leverage = self.leverage,
+                sell_leverage = self.leverage
+            )
+            # Only send position_idx if not linear
+            if Config.BYBIT_CONFIG['category'] != 'linear':
+                params['position_idx'] = self.position_idx
+            await asyncio.to_thread(
+                self.session.set_leverage,
+                **params
             )
         except Exception as e:
             logger.warning(
@@ -88,7 +116,8 @@ class TradeService:
             symbol=self.symbol,
             tick_size=self.tick_size,
             lot_size=self.lot_size,
-            leverage=self.leverage
+            leverage=self.leverage,
+            position_idx=self.position_idx
         )
         return True
 
@@ -161,17 +190,20 @@ class TradeService:
                 self.session.get_wallet_balance,
                 accountType="UNIFIED"
             )
-            acct = bal["result"]["list"][0]["coin"]
-            equity = next(
-                (float(c["usdValue"]) for c in acct if c["coin"]=="USDT"),
-                0.0
-            )
+            acct = bal.get("result", {}).get("list")
+            equity = 0.0
+            if acct and isinstance(acct, list) and len(acct) > 0:
+                coins = acct[0].get("coin", [])
+                equity = next(
+                    (float(c["usdValue"]) for c in coins if c["coin"] == "USDT"),
+                    0.0
+                )
             if equity <= 0:
                 logger.warning("No USDT equity available", symbol=self.symbol)
                 return
             risk_amount = equity * self.risk_pct
 
-            stop_price = price * (1 - self.sl_pct) if side=='long' else price * (1 + self.sl_pct)
+            stop_price = price * (1 - self.sl_pct) if side == 'long' else price * (1 + self.sl_pct)
             unit_risk  = abs(price - stop_price) or self.lot_size
             qty = max(risk_amount / unit_risk, self.lot_size)
             qty = (int(qty // self.lot_size)) * self.lot_size  # round down
@@ -180,7 +212,7 @@ class TradeService:
                 self.session.place_active_order,
                 category  = Config.BYBIT_CONFIG['category'],
                 symbol    = self.symbol,
-                side      = 'Buy' if side=='long' else 'Sell',
+                side      = 'Buy' if side == 'long' else 'Sell',
                 orderType = 'Market',
                 qty       = str(qty),
                 leverage  = str(self.leverage),
@@ -203,7 +235,7 @@ class TradeService:
 
     async def _exit(self, price: float):
         try:
-            side = 'Sell' if self.current_pos=='long' else 'Buy'
+            side = 'Sell' if self.current_pos == 'long' else 'Buy'
             resp = await asyncio.to_thread(
                 self.session.place_active_order,
                 category  = Config.BYBIT_CONFIG['category'],
